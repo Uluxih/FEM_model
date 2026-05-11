@@ -1,26 +1,31 @@
 from abc import ABC, abstractmethod
 import numpy as np
 
+
 class Shape(ABC):
     """Отвечает за геометрию и интерполяцию поля (функции формы, Якобиан)"""
 
     @abstractmethod
-    def get_shape_functions(self, xi, eta):
+    def get_shape_functions(self, local_coords):
+        """
+        local_coords: массив или список локальных координат.
+        Для 1D: [xi], для 2D: [xi, eta], для 3D: [xi, eta, zeta]
+        """
         pass
 
     @abstractmethod
-    def get_jacobian(self, xi, eta, node_coords):
-        """Возвращает матрицу Якоби и ее определитель |J|"""
+    def get_jacobian(self, local_coords, node_coords):
+        """Возвращает кортеж (Матрица Якоби J, определитель |J|)"""
         pass
 
     @abstractmethod
-    def get_shape_derivatives_cartesian(self, xi, eta, node_coords):
-        """Возвращает производные функций формы по x и y"""
+    def get_shape_derivatives_cartesian(self, local_coords, node_coords):
+        """Возвращает производные функций формы по глобальным осям (x, y, z)"""
         pass
 
 
 class AnalysisModel(ABC):
-    """Отвечает за дифференциальное уравнение (Truss, Plane Stress, 3D Solid)"""
+    """Отвечает за дифференциальное уравнение (Truss, Plane Stress, 3D Solid и т.д.)"""
 
     @abstractmethod
     def get_B_matrix(self, shape_derivatives):
@@ -29,7 +34,7 @@ class AnalysisModel(ABC):
 
     @abstractmethod
     def get_h_coefficient(self):
-        """Возвращает коэффициент объема h (например, толщину для 2D)"""
+        """Возвращает коэффициент объема h (например, толщину t для 2D, 1.0 для 3D)"""
         pass
 
 
@@ -48,13 +53,18 @@ class Element(ABC):
         """
         # Получаем координаты узлов элемента
         node_coords = np.array([node.coords for node in self.nodes])
-        ndof = len(self.nodes) * 2  # Для 2D задач (u, v)
+
+        # Универсальное вычисление количества степеней свободы (ndof)
+        # Работает для любых элементов (2D, 3D, балки с 6 dof на узел и т.д.)
+        ndof = sum(node.ndof for node in self.nodes)
+
         K = np.zeros((ndof, ndof))
 
         for ip in self.integration_points:
             # 1. Геометрия (Shape)
-            detJ = self.shape.get_jacobian(ip.xi, ip.eta, node_coords)[1]
-            dN_dx = self.shape.get_shape_derivatives_cartesian(ip.xi, ip.eta, node_coords)
+            # Передаем универсальные координаты точки интегрирования (ip.coords)
+            _, detJ = self.shape.get_jacobian(ip.coords, node_coords)
+            dN_dx = self.shape.get_shape_derivatives_cartesian(ip.coords, node_coords)
 
             # 2. Модель анализа (Analysis Model)
             B = self.analysis_model.get_B_matrix(dN_dx)
@@ -101,12 +111,12 @@ class ElementFactory(ABC):
 
     @abstractmethod
     def _get_shape(self) -> 'Shape':
-        """Возвращает объект геометрии (например, Quadrilateral4Node)"""
+        """Возвращает объект геометрии (например, Quadrilateral4Node или Hexahedron8Node)"""
         pass
 
     @abstractmethod
     def _get_analysis_model(self, **kwargs) -> 'AnalysisModel':
-        """Возвращает объект дифференциальной модели (например, PlaneStress2DModel)"""
+        """Возвращает объект дифференциальной модели (например, PlaneStress2DModel или Solid3DModel)"""
         pass
 
     @abstractmethod

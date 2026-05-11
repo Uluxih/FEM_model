@@ -10,7 +10,7 @@ import os
 # Настройки
 OUTPUT_FILE = "project_context.txt"
 EXTENSIONS = {".py"}  # Какие файлы собирать
-IGNORE_DIRS = {".git", "__pycache__", ".venv", "venv", ".idea", ".vscode"}  # Что игнорировать
+IGNORE_DIRS = {".git", "__pycache__", ".venv", "venv", ".idea", ".vscode", ".Tests"}  # Что игнорировать
 
 
 def create_context():
@@ -44,160 +44,6 @@ def create_context():
 
 if __name__ == "__main__":
     create_context()
-
-
-====================
-File: .\main.py
-====================
-
-from Abstract.Element_Level import *
-from Abstract.Structure_Level import *
-from Integration_Point_Level import *
-from abc import ABC, abstractmethod
-import numpy as np
-from FEM.Integration_Point_Level.LinElastPlaStr import *
-from FEM.Structure_Level.LinearStaticControl import *
-
-
-class Quadrilateral4Node(Shape):
-    """Билинейный 4-узловой четырехугольник (Q4)"""
-
-    def get_shape_functions(self, xi, eta):
-        # N1, N2, N3, N4
-        return 0.25 * np.array([
-            (1 - xi) * (1 - eta),
-            (1 + xi) * (1 - eta),
-            (1 + xi) * (1 + eta),
-            (1 - xi) * (1 + eta)
-        ])
-
-    def get_jacobian(self, xi, eta, node_coords):
-        # Производные функций формы по локальным координатам (xi, eta)
-        dN_dxi_eta = 0.25 * np.array([
-            [-(1 - eta), (1 - eta), (1 + eta), -(1 + eta)],
-            [-(1 - xi), -(1 + xi), (1 + xi), (1 - xi)]
-        ])
-        # Якобиан J = dN/dxi_eta * Координаты
-        J = dN_dxi_eta @ node_coords
-        detJ = np.linalg.det(J)
-        return J, detJ, dN_dxi_eta
-
-    def get_shape_derivatives_cartesian(self, xi, eta, node_coords):
-        J, _, dN_dxi_eta = self.get_jacobian(xi, eta, node_coords)
-        J_inv = np.linalg.inv(J)
-        # Производные по глобальным координатам (x, y)
-        dN_dx_dy = J_inv @ dN_dxi_eta
-        return dN_dx_dy
-
-
-# --- КОНКРЕТНАЯ МОДЕЛЬ АНАЛИЗА (Analysis Model) ---
-class PlaneStress2DModel(AnalysisModel):
-    """Модель плоского напряженного состояния"""
-
-    def __init__(self, thickness):
-        self.thickness = thickness
-
-    def get_B_matrix(self, dN_dx_dy):
-        """
-        Собирает матрицу градиентов B.
-        dN_dx_dy имеет размерность (2, 4): строка 0 - по x, строка 1 - по y
-        """
-        num_nodes = dN_dx_dy.shape[1]
-        B = np.zeros((3, num_nodes * 2))
-
-        for i in range(num_nodes):
-            dN_dx = dN_dx_dy[0, i]
-            dN_dy = dN_dx_dy[1, i]
-
-            # Матрица B для 2D упругости
-            B[0, 2 * i] = dN_dx
-            B[1, 2 * i + 1] = dN_dy
-            B[2, 2 * i] = dN_dy
-            B[2, 2 * i + 1] = dN_dx
-
-        return B
-
-    def get_h_coefficient(self):
-        return self.thickness
-
-class Q4PlaneStressFactory(ElementFactory):
-    """Конкретная фабрика для создания 2D элементов Q4 (Плоское напряженное состояние)"""
-
-    def _get_shape(self):
-        # Возвращаем наш шаблон геометрии
-        return Quadrilateral4Node()
-
-    def _get_analysis_model(self, **kwargs):
-        # Извлекаем толщину из аргументов (по умолчанию 1.0)
-        thickness = kwargs.get('thickness', 1.0)
-        return PlaneStress2DModel(thickness=thickness)
-
-    def _create_integration_points(self, material, **kwargs):
-        # Проверяем, запросил ли пользователь редуцированное интегрирование
-        reduced_integration = kwargs.get('reduced_integration', False)
-
-        integration_points = []
-
-        if reduced_integration:
-            # Редуцированное интегрирование: 1 точка Гаусса в центре
-            # Создаем уникальную физическую модель для этой точки
-            physics = LinearElasticPlaneStress(material)
-            # Вес для 1 точки в квадрате [-1, 1]x[-1, 1] равен 4.0
-            integration_points.append(IntegrationPoint(0.0, 0.0, 4.0, physics))
-
-        else:
-            # Полное интегрирование: 4 точки Гаусса (2x2)
-            g = 1.0 / np.sqrt(3.0)
-            gauss_coords = [(-g, -g), (g, -g), (g, g), (-g, g)]
-
-            for xi, eta in gauss_coords:
-                # ВАЖНО: Для КАЖДОЙ точки создаем СВОЙ экземпляр модели материала.
-                # Если в будущем мы добавим пластичность, каждая точка будет
-                # независимо хранить свои пластические деформации.
-                physics = LinearElasticPlaneStress(material)
-
-                # Вес каждой точки равен 1.0
-                integration_points.append(IntegrationPoint(xi, eta, 1.0, physics))
-
-        return integration_points
-
-
-def main():
-    # 1. Задаем узлы и материал
-    nodes = [Node(1, [0, 0]), Node(2, [1, 0]), Node(3, [1, 1]), Node(4, [0, 1])]
-    steel = Material(E=2e11, nu=0.3)
-
-    # 2. Создаем нужную фабрику
-    factory = Q4PlaneStressFactory()
-
-    # 3. Просим фабрику создать элемент
-    # Полное интегрирование (по умолчанию)
-    element_full = factory.create_element(nodes, material=steel, thickness=0.01)
-
-    # Или редуцированное интегрирование
-    element_reduced = factory.create_element(nodes, material=steel, thickness=0.01, reduced_integration=True)
-
-    # 4. Добавляем в модель и решаем...
-    model = FEModel()
-    model.elements = [element_full]
-    model.nodes = nodes
-    model.materials = [steel]
-
-    print("7. Запуск алгоритма расчета (Control)...")
-    solver = LinearStaticControl(model)
-    solver.solve()
-
-    print("\n--- РЕЗУЛЬТАТ ---")
-    print("Локальная матрица жесткости элемента (размер 8x8):")
-    K_local = element_full.compute_stiffness()
-
-    # Выведем матрицу красиво
-    np.set_printoptions(precision=2, linewidth=100)
-    print(K_local)
-
-if __name__ == "__main__":
-    main()
-    # ...
 
 
 ====================
@@ -261,26 +107,31 @@ File: .\FEM\Abstract\Element_Level.py
 from abc import ABC, abstractmethod
 import numpy as np
 
+
 class Shape(ABC):
     """Отвечает за геометрию и интерполяцию поля (функции формы, Якобиан)"""
 
     @abstractmethod
-    def get_shape_functions(self, xi, eta):
+    def get_shape_functions(self, local_coords):
+        """
+        local_coords: массив или список локальных координат.
+        Для 1D: [xi], для 2D: [xi, eta], для 3D: [xi, eta, zeta]
+        """
         pass
 
     @abstractmethod
-    def get_jacobian(self, xi, eta, node_coords):
-        """Возвращает матрицу Якоби и ее определитель |J|"""
+    def get_jacobian(self, local_coords, node_coords):
+        """Возвращает кортеж (Матрица Якоби J, определитель |J|)"""
         pass
 
     @abstractmethod
-    def get_shape_derivatives_cartesian(self, xi, eta, node_coords):
-        """Возвращает производные функций формы по x и y"""
+    def get_shape_derivatives_cartesian(self, local_coords, node_coords):
+        """Возвращает производные функций формы по глобальным осям (x, y, z)"""
         pass
 
 
 class AnalysisModel(ABC):
-    """Отвечает за дифференциальное уравнение (Truss, Plane Stress, 3D Solid)"""
+    """Отвечает за дифференциальное уравнение (Truss, Plane Stress, 3D Solid и т.д.)"""
 
     @abstractmethod
     def get_B_matrix(self, shape_derivatives):
@@ -289,7 +140,7 @@ class AnalysisModel(ABC):
 
     @abstractmethod
     def get_h_coefficient(self):
-        """Возвращает коэффициент объема h (например, толщину для 2D)"""
+        """Возвращает коэффициент объема h (например, толщину t для 2D, 1.0 для 3D)"""
         pass
 
 
@@ -308,13 +159,18 @@ class Element(ABC):
         """
         # Получаем координаты узлов элемента
         node_coords = np.array([node.coords for node in self.nodes])
-        ndof = len(self.nodes) * 2  # Для 2D задач (u, v)
+
+        # Универсальное вычисление количества степеней свободы (ndof)
+        # Работает для любых элементов (2D, 3D, балки с 6 dof на узел и т.д.)
+        ndof = sum(node.ndof for node in self.nodes)
+
         K = np.zeros((ndof, ndof))
 
         for ip in self.integration_points:
             # 1. Геометрия (Shape)
-            detJ = self.shape.get_jacobian(ip.xi, ip.eta, node_coords)[1]
-            dN_dx = self.shape.get_shape_derivatives_cartesian(ip.xi, ip.eta, node_coords)
+            # Передаем универсальные координаты точки интегрирования (ip.coords)
+            _, detJ = self.shape.get_jacobian(ip.coords, node_coords)
+            dN_dx = self.shape.get_shape_derivatives_cartesian(ip.coords, node_coords)
 
             # 2. Модель анализа (Analysis Model)
             B = self.analysis_model.get_B_matrix(dN_dx)
@@ -361,12 +217,12 @@ class ElementFactory(ABC):
 
     @abstractmethod
     def _get_shape(self) -> 'Shape':
-        """Возвращает объект геометрии (например, Quadrilateral4Node)"""
+        """Возвращает объект геометрии (например, Quadrilateral4Node или Hexahedron8Node)"""
         pass
 
     @abstractmethod
     def _get_analysis_model(self, **kwargs) -> 'AnalysisModel':
-        """Возвращает объект дифференциальной модели (например, PlaneStress2DModel)"""
+        """Возвращает объект дифференциальной модели (например, PlaneStress2DModel или Solid3DModel)"""
         pass
 
     @abstractmethod
@@ -410,66 +266,99 @@ class ConstitutiveModel(ABC):
         """Возвращает вектор напряжений (формула 2 в статье)"""
         pass
 
-
 class IntegrationPoint:
-    """Точка интегрирования (хранит локальные координаты, вес и модель материала)"""
-
-    def __init__(self, xi, eta, weight, constitutive_model):
-        self.xi = xi
-        self.eta = eta
+    """Универсальная точка интегрирования"""
+    def __init__(self, coords, weight, constitutive_model):
+        self.coords = coords  # Универсальные координаты: [xi, eta, zeta]
         self.weight = weight
-        self.constitutive_model = constitutive_model  # Ссылка на Constitutive Model
-
+        self.constitutive_model = constitutive_model
 
 ====================
 File: .\FEM\Abstract\Structure_Level.py
 ====================
 
+# ====================================
+# File: .\FEM\Abstract\Structure_Level.py
+# ====================================
 from abc import ABC, abstractmethod
 import numpy as np
+
 
 class Node:
     """Узел КЭ-сетки"""
 
-    def __init__(self, id, coords):
+    def __init__(self, id, coords, ndof=None):
         self.id = id
-        self.coords = coords
-        self.dofs = []  # Глобальные номера степеней свободы
-        self.displacements = np.zeros(2)
+        self.coords = np.array(coords, dtype=float)
+        self.ndof = ndof if ndof is not None else len(self.coords)
+        self.dofs = []
+        self.displacements = np.zeros(self.ndof)
+
+
+class BoundaryCondition:
+    """Кинематическое граничное условие (закрепление / заданное перемещение)"""
+
+    def __init__(self, node, dof_axis, value=0.0):
+        self.node = node
+        self.dof_axis = dof_axis  # 0 для X, 1 для Y, 2 для Z
+        self.value = value
+
+
+class NodalLoad:
+    """Узловая сила"""
+
+    def __init__(self, node, dof_axis, value):
+        self.node = node
+        self.dof_axis = dof_axis  # 0 для X, 1 для Y, 2 для Z
+        self.value = value
 
 
 class FEModel:
-    """Глобальная модель, хранящая списки узлов, элементов, материалов"""
+    """Глобальная модель, хранящая списки узлов, элементов, материалов и ГУ"""
 
     def __init__(self):
         self.nodes = []
         self.elements = []
         self.materials = []
-        self.load_elements = []  # Для естественных граничных условий (нагрузок)
+
+        # Списки для граничных условий и нагрузок
+        self.bcs = []
+        self.nodal_loads = []
+
         self.K_global = None
         self.F_global = None
+        self.total_dofs = 0
 
     def initialize(self):
-        """Нумерация степеней свободы, выделение памяти"""
-        total_dofs = len(self.nodes) * 2
-        self.K_global = np.zeros((total_dofs, total_dofs))
-        self.F_global = np.zeros(total_dofs)
-        # В реальном коде здесь задаются индексы степеней свободы для сборки
+        """Нумерация степеней свободы и выделение памяти"""
+        current_eq_num = 0
+        for node in self.nodes:
+            node.dofs = list(range(current_eq_num, current_eq_num + node.ndof))
+            current_eq_num += node.ndof
+
+        self.total_dofs = current_eq_num
+        self.K_global = np.zeros((self.total_dofs, self.total_dofs))
+        self.F_global = np.zeros(self.total_dofs)
 
     def assemble(self):
-        """Сборка глобальной матрицы жесткости (consumer запрашивает у supplier)"""
+        """Сборка глобальной матрицы жесткости"""
         for element in self.elements:
-            # Инкапсуляция: глобальный алгоритм не знает, какой это элемент (Q4, T3 и т.д.)
-            # Он просто вызывает generic метод compute_stiffness()
             K_e = element.compute_stiffness()
+            global_indices = []
+            for node in element.nodes:
+                global_indices.extend(node.dofs)
+            self.K_global[np.ix_(global_indices, global_indices)] += K_e
 
-            # Псевдокод сборки:
-            # global_indices = self.get_global_indices(element)
-            # self.K_global[np.ix_(global_indices, global_indices)] += K_e
+    # --- Новые вспомогательные методы ---
+    def add_bc(self, node, dof_axis, value=0.0):
+        self.bcs.append(BoundaryCondition(node, dof_axis, value))
+
+    def add_load(self, node, dof_axis, value):
+        self.nodal_loads.append(NodalLoad(node, dof_axis, value))
 
 
 class Control(ABC):
-    """Базовый класс для алгоритмов расчета (Linear Static, Nonlinear и т.д.)"""
+    """Базовый класс для алгоритмов расчета"""
 
     def __init__(self, model: FEModel):
         self.model = model
@@ -479,135 +368,1321 @@ class Control(ABC):
         pass
 
 
-
 ====================
-File: .\FEM\Element_Level\NonLinElem.py
-====================
-
-
-class Element:
-    # ... старые методы ...
-
-    def compute_internal_force(self):
-        # Получаем текущие перемещения узлов элемента
-        u_e = self.get_element_displacements()
-        ndof = len(self.nodes) * 2
-        F_int = np.zeros(ndof)
-
-        for ip in self.integration_points:
-            _, detJ, _ = self.shape.get_jacobian(...)
-            dN_dx = self.shape.get_shape_derivatives_cartesian(...)
-            B = self.analysis_model.get_B_matrix(dN_dx)
-            h = self.analysis_model.get_h_coefficient()
-
-            # 1. Вычисляем текущую деформацию
-            strain = B @ u_e
-
-            # 2. Запрашиваем текущее напряжение у физической модели
-            stress = ip.constitutive_model.get_stress(strain)
-
-            # 3. Интегрируем B^T * sigma
-            F_int += B.T @ stress * detJ * h * ip.weight
-
-        return F_int
-
-
-====================
-File: .\FEM\Integration_Point_Level\LinElastPlaStr.py
+File: .\FEM\Element_Level\Shape8NodeHexahedron.py
 ====================
 
-from Abstract.Element_Level import *
-from Abstract.Structure_Level import *
-from Abstract.Integration_Point_Level import *
+import numpy as np
+from FEM.Abstract.Element_Level import Shape, AnalysisModel, ElementFactory
+from FEM.Abstract.Integration_Point_Level import IntegrationPoint
+from FEM.Element_Level.Solid3DModel import *
 
-class LinearElasticPlaneStress(ConstitutiveModel):
-    """Пример: Линейно-упругая модель для плоского напряженного состояния"""
+class Shape8NodeHexahedron(Shape):
+    """Геометрия 8-узлового объемного изопараметрического элемента (HEX8)"""
 
+    def __init__(self):
+        # Локальные координаты узлов в стандартном кубе [-1, 1]
+        # Порядок обхода: нижняя грань (z=-1) против часовой, затем верхняя грань (z=1)
+        self.xi_i = np.array([-1, 1, 1, -1, -1, 1, 1, -1])
+        self.eta_i = np.array([-1, -1, 1, 1, -1, -1, 1, 1])
+        self.zeta_i = np.array([-1, -1, -1, -1, 1, 1, 1, 1])
+
+    def get_shape_functions(self, local_coords):
+        xi, eta, zeta = local_coords
+        # N_i = 1/8 * (1 + xi*xi_i) * (1 + eta*eta_i) * (1 + zeta*zeta_i)
+        N = 0.125 * (1 + xi * self.xi_i) * (1 + eta * self.eta_i) * (1 + zeta * self.zeta_i)
+        return N
+
+    def _get_local_derivatives(self, local_coords):
+        """Производные dN/dxi, dN/deta, dN/dzeta"""
+        xi, eta, zeta = local_coords
+        dN_dxi = 0.125 * self.xi_i * (1 + eta * self.eta_i) * (1 + zeta * self.zeta_i)
+        dN_deta = 0.125 * self.eta_i * (1 + xi * self.xi_i) * (1 + zeta * self.zeta_i)
+        dN_dzeta = 0.125 * self.zeta_i * (1 + xi * self.xi_i) * (1 + eta * self.eta_i)
+        return np.array([dN_dxi, dN_deta, dN_dzeta])  # Размерность (3, 8)
+
+    def get_jacobian(self, local_coords, node_coords):
+        local_derivs = self._get_local_derivatives(local_coords)
+        # Матрица Якоби: J = [dN/dxi, dN/deta, dN/dzeta] * [X, Y, Z]
+        J = local_derivs @ node_coords  # (3, 8) @ (8, 3) -> (3, 3)
+        detJ = np.linalg.det(J)
+        return J, detJ
+
+    def get_shape_derivatives_cartesian(self, local_coords, node_coords):
+        local_derivs = self._get_local_derivatives(local_coords)
+        J, _ = self.get_jacobian(local_coords, node_coords)
+        J_inv = np.linalg.inv(J)
+
+        # [dN/dx, dN/dy, dN/dz]^T = J^-1 * [dN/dxi, dN/deta, dN/dzeta]^T
+        dN_dx = J_inv @ local_derivs  # (3, 3) @ (3, 8) -> (3, 8)
+        return dN_dx
+
+# ==========================================
+# 3. ФАБРИКА ЭЛЕМЕНТОВ (FACTORY)
+# ==========================================
+class HEX8Factory(ElementFactory):
+    """Фабрика для сборки 3D элементов HEX8"""
+
+    def _get_shape(self) -> Shape:
+        return Shape8NodeHexahedron()
+
+    def _get_analysis_model(self, **kwargs) -> AnalysisModel:
+        return Solid3DModel()
+
+    def _create_integration_points(self, material, **kwargs) -> list:
+        """
+        Создает 8 точек интегрирования по правилу Гаусса (2x2x2).
+        Ожидает в kwargs параметр `constitutive_class` (класс физической модели).
+        """
+        # Правило Гаусса для 2 точек
+        g = 1.0 / np.sqrt(3.0)
+        gauss_coords = [-g, g]
+        gauss_weight = 1.0  # Вес каждой точки в 1D равен 1.0
+
+        # Получаем класс физической модели из аргументов (упругость, пластичность и т.д.)
+        constitutive_class = kwargs.get('constitutive_class')
+        if constitutive_class is None:
+            raise ValueError("Для создания элемента необходимо передать 'constitutive_class' в kwargs")
+
+        integration_points = []
+
+        # Тройной цикл для 3D
+        for xi in gauss_coords:
+            for eta in gauss_coords:
+                for zeta in gauss_coords:
+                    # В 3D вес: W = w_xi * w_eta * w_zeta = 1.0 * 1.0 * 1.0 = 1.0
+                    weight = gauss_weight * gauss_weight * gauss_weight
+
+                    # Создаем индивидуальный экземпляр модели материала для этой точки
+                    # (Крайне важно для нелинейных расчетов, где каждая точка хранит свою историю деформаций)
+                    c_model = constitutive_class(material)
+
+                    ip = IntegrationPoint(
+                        coords=[xi, eta, zeta],
+                        weight=weight,
+                        constitutive_model=c_model
+                    )
+                    integration_points.append(ip)
+
+        return integration_points
+
+====================
+File: .\FEM\Element_Level\Solid3DModel.py
+====================
+
+import numpy as np
+from FEM.Abstract.Element_Level import Shape, AnalysisModel, ElementFactory
+from FEM.Abstract.Integration_Point_Level import IntegrationPoint
+from FEM.Element_Level.Shape8NodeHexahedron import *
+
+
+class Solid3DModel(AnalysisModel):
+    """Модель сплошной 3D среды (6 компонент деформации, 3 перемещения на узел)"""
+
+    def get_B_matrix(self, shape_derivatives):
+        """
+        Собирает матрицу B (размер 6 x 24).
+        Порядок деформаций: [xx, yy, zz, xy, yz, xz]
+        """
+        num_nodes = shape_derivatives.shape[1]  # 8 узлов
+        B = np.zeros((6, num_nodes * 3))
+
+        for i in range(num_nodes):
+            dN_dx = shape_derivatives[0, i]
+            dN_dy = shape_derivatives[1, i]
+            dN_dz = shape_derivatives[2, i]
+
+            # Индексы столбцов для текущего узла (u, v, w)
+            col_x = 3 * i
+            col_y = 3 * i + 1
+            col_z = 3 * i + 2
+
+            # Нормальные деформации
+            B[0, col_x] = dN_dx
+            B[1, col_y] = dN_dy
+            B[2, col_z] = dN_dz
+
+            # Сдвиговые деформации (инженерные гамма)
+            B[3, col_x] = dN_dy
+            B[3, col_y] = dN_dx
+
+            B[4, col_y] = dN_dz
+            B[4, col_z] = dN_dy
+
+            B[5, col_x] = dN_dz
+            B[5, col_z] = dN_dx
+
+        return B
+
+    def get_h_coefficient(self):
+        # В 3D интегрирование идет по объему (dV = detJ * dxi * deta * dzeta),
+        # поэтому дополнительная толщина не нужна.
+        return 1.0
+
+
+
+
+====================
+File: .\FEM\Integration_Point_Level\ElasticModel3D.py
+====================
+
+from FEM.Abstract.Integration_Point_Level import ConstitutiveModel
+from FEM.Abstract.Structure_Level import Node
+import numpy as np
+from FEM.Abstract.Element_Level import Shape, AnalysisModel, ElementFactory
+from FEM.Abstract.Integration_Point_Level import IntegrationPoint
+from FEM.Element_Level.Solid3DModel import *
+
+
+# 1. Простая 3D упругая модель для теста
+class ElasticModel3D(ConstitutiveModel):
     def get_tangent_matrix(self):
-        E, nu = self.material.E, self.material.nu
-        factor = E / (1 - nu ** 2)
-        return factor * np.array([
-            [1, nu, 0],
-            [nu, 1, 0],
-            [0, 0, (1 - nu) / 2]
-        ])
+        E = self.material.E
+        nu = self.material.nu
+        C = E / ((1 + nu) * (1 - 2 * nu))
+
+        D = np.zeros((6, 6))
+        D[0:3, 0:3] = C * nu
+        D[0, 0] = D[1, 1] = D[2, 2] = C * (1 - nu)
+
+        G = E / (2 * (1 + nu))
+        D[3, 3] = D[4, 4] = D[5, 5] = G
+        return D
 
     def get_stress(self, strain):
-        D = self.get_tangent_matrix()
-        return D @ strain
+        return self.get_tangent_matrix() @ strain
+
+
+
+====================
+File: .\FEM\Integration_Point_Level\CriticalPlane\criterion.py
+====================
+
+import numpy as np
+from scipy.optimize import minimize, minimize_scalar
+import pytest
+from FEM.Integration_Point_Level.CriticalPlane.tensor import StressTensor
+import FEM.Integration_Point_Level.CriticalPlane.material as mt
+
+# ==========================================
+# ДОБАВЛЕНО: Функция вычисления вектора нормали
+# ==========================================
+def get_normal_vector(params, mode='3D'):
+    """
+    Преобразует угловые параметры в единичный вектор нормали.
+    В 3D: params = [theta, phi] (полярный и азимутальный углы)
+    В 2D_XZ: params = theta (угол в плоскости XZ)
+    """
+    if mode == '3D':
+        theta, phi = params[0], params[1]
+        nx = np.sin(theta) * np.cos(phi)
+        ny = np.sin(theta) * np.sin(phi)
+        nz = np.cos(theta)
+        return np.array([nx, ny, nz])
+    elif mode == '2D_XZ':
+        # Обработка случая, когда params передается как список [theta] или как число theta
+        theta = params[0] if isinstance(params, (list, tuple, np.ndarray)) else params
+        nx = np.sin(theta)
+        ny = 0.0
+        nz = np.cos(theta)
+        return np.array([nx, ny, nz])
+    else:
+        raise ValueError(f"Неизвестный режим: {mode}")
+
+
+def global_maximize(objective_func, mode='3D'):
+    """
+    Глобальная оптимизация для 3D путём запуска локального поиска из нескольких стартовых точек.
+    """
+    if mode == '2D_XZ':
+        raise ValueError("global_maximize не предназначена для 2D режима")
+
+    bounds = [(0, np.pi), (0, 2 * np.pi)]
+    best_res = None
+    best_f = -float('inf')
+
+    starting_points = [
+        [0, 0],                  # Z
+        [np.pi / 2, 0],          # X
+        [np.pi / 2, np.pi / 2],  # Y
+        [np.pi / 4, np.pi / 4]   # диагональ
+    ]
+
+    for x0 in starting_points:
+        res = minimize(objective_func, x0, bounds=bounds, method='L-BFGS-B')
+        if -res.fun > best_f:
+            best_f = -res.fun
+            best_res = res
+
+    return best_res.x, best_f
+
+
+# ==========================================
+# 1. КРИТЕРИЙ СДВИГА
+# ==========================================
+def calculate_criterion_shear(params, stress_tensor, material:mt.Material, mode='3D'):
+    mu=material.mu
+    A_tensor=material.A_tensor
+
+    n = get_normal_vector(params, mode)
+    sigma_n = stress_tensor.normal_stress(n)
+    tau_n = stress_tensor.shear_stress_magnitude(n)
+
+    # Направление сдвига (s_geom) – единичный вектор в плоскости площадки
+    if tau_n > 1e-9:
+        s_geom = stress_tensor.shear_stress_vector(n) / tau_n
+    else:
+        # Выбираем произвольное направление, ортогональное нормали
+        if abs(n[2]) < 0.9:
+            s_geom = np.cross(n, np.array([0, 0, 1]))
+        else:
+            s_geom = np.cross(n, np.array([1, 0, 0]))
+        s_geom = s_geom / np.linalg.norm(s_geom)
+
+    # Вычисление C = sqrt(v·A·v), где v = n⊗s
+    C_val = material.get_cohesion(n, s_geom)
+
+    # Сопротивление сдвигу
+    mu_tens = material.mu_tensile  # коэффициент трения при растяжении
+    if sigma_n > 0:
+        resistance = C_val + mu_tens * sigma_n
+
+    else:
+        resistance = C_val + mu * sigma_n
+
+
+    f_val = tau_n - resistance
+    return f_val, n, tau_n, resistance
+
+
+def find_critical_plane_shear(stress_tensor, material, mode='3D'):
+
+    mu=material.mu
+    A_tensor=material.A_tensor
+
+    def objective(p):
+        f_val, _, _, _ = calculate_criterion_shear(p, stress_tensor, material, mode)
+        return -f_val
+
+    if mode == '2D_XZ':
+        res = minimize_scalar(objective, bounds=(0, np.pi), method='bounded')
+        best_params = [res.x]
+        max_f = -res.fun
+    else:
+        best_params, max_f = global_maximize(objective, mode)
+
+    _, best_n, tau_n, resistance = calculate_criterion_shear(best_params, stress_tensor, material, mode)
+
+    if abs(resistance) < 1e-9:
+        utilization = float('inf') if tau_n > 1e-9 else 0.0
+    else:
+        utilization = tau_n / resistance
+
+    return max_f, best_n, utilization
+
+
+# ==========================================
+# 2. КРИТЕРИЙ РАСТЯЖЕНИЯ
+# ==========================================
+def calculate_criterion_tensile(params, stress_tensor, material, mode='3D'):
+    Rpx=material.Rpx
+    Rpy=material.Rpy
+    Rpz=material.Rpz
+    n = get_normal_vector(params, mode)
+    sigma_n = stress_tensor.normal_stress(n)
+    Rp_n = Rpx * n[0] ** 2 + Rpy * n[1] ** 2 + Rpz * n[2] ** 2
+    f_val = sigma_n - Rp_n
+    return f_val, n, sigma_n, Rp_n
+
+
+def find_critical_plane_tensile(stress_tensor, material, mode='3D'):
+    Rpx=material.Rpx
+    Rpy=material.Rpy
+    Rpz=material.Rpz
+    def objective(p):
+        f_val, _, _, _ = calculate_criterion_tensile(p, stress_tensor, material, mode='3D')
+        return -f_val
+
+    if mode == '2D_XZ':
+        res = minimize_scalar(objective, bounds=(0, np.pi), method='bounded')
+        best_params = [res.x]
+        max_f = -res.fun
+    else:
+        best_params, max_f = global_maximize(objective, mode)
+
+    _, best_n, sigma_n, Rp_n = calculate_criterion_tensile(best_params, stress_tensor, material, mode='3D')
+
+    if Rp_n < 1e-9:
+        utilization = float('inf')
+    else:
+        utilization = sigma_n / Rp_n if sigma_n > 0 else 0.0
+
+    return max_f, best_n, utilization
+
+
+# ==========================================
+# 3. КРИТЕРИЙ СЖАТИЯ
+# ==========================================
+def calculate_criterion_compression(params, stress_tensor, material, mode='3D'):
+    Rcx=material.Rcx
+    Rcy=material.Rcy
+    Rcz=material.Rcz
+    n = get_normal_vector(params, mode)
+    sigma_n = stress_tensor.normal_stress(n)
+    Rc_n = Rcx * n[0] ** 2 + Rcy * n[1] ** 2 + Rcz * n[2] ** 2
+    f_val = -sigma_n - Rc_n
+    return f_val, n, sigma_n, Rc_n
+
+
+def find_critical_plane_compression(stress_tensor, material, mode='3D'):
+    Rcx=material.Rcx
+    Rcy=material.Rcy
+    Rcz=material.Rcz
+    def objective(p):
+        f_val, _, _, _ = calculate_criterion_compression(p, stress_tensor, material, mode)
+        return -f_val
+
+    if mode == '2D_XZ':
+        res = minimize_scalar(objective, bounds=(0, np.pi), method='bounded')
+        best_params = [res.x]
+        max_f = -res.fun
+    else:
+        best_params, max_f = global_maximize(objective, mode)
+
+    _, best_n, sigma_n, Rc_n = calculate_criterion_compression(best_params, stress_tensor, material, mode)
+
+    comp_stress = -sigma_n
+    if Rc_n < 1e-9:
+        utilization = float('inf')
+    else:
+        utilization = comp_stress / Rc_n if comp_stress > 0 else 0.0
+
+    return max_f, best_n, utilization
+
+====================
+File: .\FEM\Integration_Point_Level\CriticalPlane\CriticalPlanePlasticity3D.py
+====================
+
+import numpy as np
+from FEM.Abstract.Integration_Point_Level import ConstitutiveModel
+from FEM.Integration_Point_Level.CriticalPlane.tensor import StressTensor
+from FEM.Integration_Point_Level.CriticalPlane import criterion as cr
+from FEM.Integration_Point_Level.CriticalPlane.GetMatrByPlane import PlanePlasticityModel
+
+
+class CriticalPlanePlasticity3D(ConstitutiveModel):
+    def __init__(self, material):
+        super().__init__(material)
+
+        E = self.material.E
+        nu = self.material.nu
+        C_el = E / ((1 + nu) * (1 - 2 * nu))
+
+        self.D_e = np.zeros((6, 6))
+        self.D_e[0:3, 0:3] = C_el * nu
+        self.D_e[0, 0] = self.D_e[1, 1] = self.D_e[2, 2] = C_el * (1 - nu)
+        G = E / (2 * (1 + nu))
+        self.D_e[3, 3] = self.D_e[4, 4] = self.D_e[5, 5] = G
+
+        # --- СОСТОЯНИЕ ПРОШЛОГО СОШЕДШЕГОСЯ ШАГА (_old) ---
+        self.stress_old = np.zeros(6)
+        self.strain_old = np.zeros(6)
+        self.kappa_old = 0.0
+        self.is_cracked_old = False
+        self.fixed_normal_old = None
+
+        # --- ТЕКУЩЕЕ (ПРОБНОЕ) СОСТОЯНИЕ В ИТЕРАЦИЯХ ---
+        self.stress = np.zeros(6)
+        self.strain = np.zeros(6)
+        self.kappa = 0.0
+        self.is_cracked = False
+        self.fixed_normal = None
+
+        self.plane_model = PlanePlasticityModel(hardening_type='cohesion')
+
+    def _voigt_to_tensor(self, v):
+        return np.array([
+            [v[0], v[3], v[5]],
+            [v[3], v[1], v[4]],
+            [v[5], v[4], v[2]]
+        ])
+
+    def get_tangent_matrix(self):
+        return self.D_e
+
+    def get_stress(self, strain):
+        return self.stress
+
+    def update_state(self, current_strain):
+        """Вызывается на каждой итерации. Считает всё от _old состояния."""
+        # 1. Считаем приращение деформации от начала текущего шага нагрузки
+        d_strain = current_strain - self.strain_old
+
+        # 2. Пробное напряжение (отталкиваемся от прошлого сошедшегося)
+        stress_trial = self.stress_old + self.D_e @ d_strain
+
+        tensor_3x3 = self._voigt_to_tensor(stress_trial)
+        st_obj = StressTensor.from_matrix(tensor_3x3)
+
+        # 3. Ищем плоскость (только если не треснули на ПРОШЛЫХ шагах)
+        if not self.is_cracked_old:
+            _, best_n, _ = cr.find_critical_plane_shear(st_obj, self.material.crit_mat, mode='3D')
+        else:
+            best_n = self.fixed_normal_old
+
+        # 4. Проверка критерия
+        sigma_n = st_obj.normal_stress(best_n)
+        tau_n = st_obj.shear_stress_magnitude(best_n)
+
+        if tau_n > 1e-12:
+            s_geom = st_obj.shear_stress_vector(best_n) / tau_n
+        else:
+            s_geom = np.cross(best_n, np.array([0, 0, 1])) if abs(best_n[2]) < 0.9 else np.cross(best_n,
+                                                                                                 np.array([1, 0, 0]))
+            s_geom = s_geom / np.linalg.norm(s_geom)
+
+        C_val = self.material.crit_mat.get_cohesion(best_n, s_geom)
+        C_threshold = 0.8 * C_val
+
+        if sigma_n > 0:
+            resistance = C_threshold + self.material.crit_mat.mu_tensile * sigma_n
+        else:
+            resistance = C_threshold + self.material.crit_mat.mu * sigma_n
+
+        f_yield = tau_n - resistance
+
+        # 5. Упругое поведение
+        if f_yield <= 1e-5:
+            self.stress = stress_trial
+            self.strain = current_strain
+            self.kappa = self.kappa_old
+            self.is_cracked = self.is_cracked_old
+            self.fixed_normal = self.fixed_normal_old
+            return self.stress, self.D_e
+
+        # 6. Пластическое поведение
+        if not self.is_cracked_old:
+            self.is_cracked = True
+            self.fixed_normal = best_n.copy()
+        else:
+            self.is_cracked = True
+            self.fixed_normal = self.fixed_normal_old
+
+        self.plane_model.kappa = self.kappa_old
+        self.plane_model.c_0 = C_threshold
+
+        D_ep = self.plane_model.get_tangent_stiffness_matrix(tensor_3x3, self.fixed_normal, self.D_e)
+
+        d_stress_real = D_ep @ d_strain
+        self.stress = self.stress_old + d_stress_real
+        self.strain = current_strain
+
+        d_strain_plastic = d_strain - np.linalg.solve(self.D_e, d_stress_real)
+        self.kappa = self.kappa_old + np.linalg.norm(d_strain_plastic)
+
+        return self.stress, D_ep
+
+    def commit(self):
+        """Вызывается решателем ТОЛЬКО когда итерации сошлись!"""
+        self.stress_old = self.stress.copy()
+        self.strain_old = self.strain.copy()
+        self.kappa_old = self.kappa
+        self.is_cracked_old = self.is_cracked
+        if self.fixed_normal is not None:
+            self.fixed_normal_old = self.fixed_normal.copy()
+
+
+====================
+File: .\FEM\Integration_Point_Level\CriticalPlane\GetMatrByPlane.py
+====================
+
+import numpy as np
+
+
+class PlanePlasticityModel:
+    def __init__(self, hardening_type='cohesion'):
+        self.hardening_type = hardening_type
+
+        # Параметры прочности
+        self.c_fixed = 2.0
+        self.mu_c = 0.6
+        self.A_mu = 0.005
+
+        self.mu_fixed = 0.4
+        self.c_0 = 1.0
+        self.c_u = 4.0
+        self.A_c = 0.005
+
+        self.sigma_0 = 1.0
+        self.eta_c = 0.7
+
+        self.kappa = 0.0  # Накопленная пластическая деформация
+
+    def get_friction_and_hardening(self):
+        mu = self.mu_c * self.kappa / (self.A_mu + self.kappa)
+        dmu_dkappa = self.mu_c * self.A_mu / ((self.A_mu + self.kappa) ** 2)
+        return mu, dmu_dkappa
+
+    def get_cohesion_and_hardening(self):
+        c = self.c_0 + (self.c_u - self.c_0) * self.kappa / (self.A_c + self.kappa)
+        dc_dkappa = (self.c_u - self.c_0) * self.A_c / ((self.A_c + self.kappa) ** 2)
+        return c, dc_dkappa
+
+    def get_tangent_stiffness_matrix(self, sigma_tensor, normal_vector, D_elastic):
+        """Вычисление упруго-пластической матрицы жесткости 6x6"""
+        n = np.array(normal_vector, dtype=float)
+        n /= np.linalg.norm(n)
+
+        t_vec = sigma_tensor @ n
+        sigma_n = np.dot(t_vec, n)
+
+        t_s_vec = t_vec - sigma_n * n
+        tau = np.linalg.norm(t_s_vec)
+
+        if tau > 1e-12:
+            s_vec = t_s_vec / tau
+        else:
+            s_vec = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+            s_vec = s_vec - np.dot(s_vec, n) * n
+            s_vec /= np.linalg.norm(s_vec)
+
+        if self.hardening_type == 'friction':
+            mu, dmu_dkappa = self.get_friction_and_hardening()
+            c = self.c_fixed
+            H = - (dmu_dkappa * sigma_n)
+        elif self.hardening_type == 'cohesion':
+            mu = self.mu_fixed
+            c, dc_dkappa = self.get_cohesion_and_hardening()
+            H = dc_dkappa
+        else:
+            raise ValueError("Неизвестный тип упрочнения")
+
+        # Проверка текучести
+        f_yield = tau + mu * sigma_n - c
+
+        if f_yield <= 1e-8:
+            print(" -> Площадка работает упруго (Критерий f <= 0)")
+            return D_elastic.copy()
+
+        print(f" -> Площадка ТЕЧЕТ! (Критерий f = {f_yield:.3f} > 0)")
+
+        # Производная пластического потенциала
+        denom = self.sigma_0 - sigma_n
+        if abs(denom) < 1e-8:
+            dpsi_dsigma = -self.eta_c
+        else:
+            dpsi_dsigma = (tau / denom) - self.eta_c
+
+        N_tens = np.outer(n, n)
+        S_tens = 0.5 * (np.outer(s_vec, n) + np.outer(n, s_vec))
+
+        df_dsigma_tens = mu * N_tens + S_tens
+        dpsi_dsigma_tens = dpsi_dsigma * N_tens + S_tens
+
+        def to_voigt(tensor):
+            return np.array([
+                tensor[0, 0], tensor[1, 1], tensor[2, 2],
+                2.0 * tensor[0, 1], 2.0 * tensor[1, 2], 2.0 * tensor[0, 2]
+            ])
+
+        n_voigt = to_voigt(df_dsigma_tens)
+        m_voigt = to_voigt(dpsi_dsigma_tens)
+
+        D_e_m = D_elastic @ m_voigt
+        n_D_e = n_voigt @ D_elastic
+
+        denominator = np.dot(n_voigt, D_e_m) + H
+        if denominator <= 0:
+            denominator = 1e-8
+
+        D_plastic = np.outer(D_e_m, n_D_e) / denominator
+        D_ep = D_elastic - D_plastic
+
+        return D_ep
+
+
+# ==========================================
+# ПРИМЕР ИСПОЛЬЗОВАНИЯ
+# ==========================================
+
+# # 1. Функция для создания 3D упругой матрицы (изотропный материал)
+# def create_elastic_matrix_3d(E, nu):
+#     C = E / ((1 + nu) * (1 - 2 * nu))
+#     D = np.zeros((6, 6))
+#     D[0:3, 0:3] = C * nu
+#     D[0, 0] = D[1, 1] = D[2, 2] = C * (1 - nu)
+#     G = E / (2 * (1 + nu))
+#     D[3, 3] = D[4, 4] = D[5, 5] = G
+#     return D
+#
+#
+# # Задаем упругие свойства (например, бетон/порода)
+# E = 20000.0  # МПа
+# nu = 0.2
+# D_elastic = create_elastic_matrix_3d(E, nu)
+#
+# # 2. Задаем состояние
+# # Допустим, площадка снижения жесткости горизонтальна (нормаль смотрит по оси Y)
+# normal_vector = np.array([0.0, 1.0, 0.0])
+#
+# # Создаем тензор напряжений, который гарантированно вызовет пластику.
+# # Сжимаем по Y (sigma_yy = -5 МПа) и даем сильный сдвиг (tau_xy = 4 МПа)
+# sigma_tensor = np.array([
+#     [0.0, 4.0, 0.0],
+#     [4.0, -5.0, 0.0],
+#     [0.0, 0.0, 0.0]
+# ])
+#
+# # 3. Инициализируем модель
+# model = PlanePlasticityModel(hardening_type='cohesion')
+#
+# # 4. Вычисляем касательную матрицу жесткости
+# np.set_printoptions(precision=1, suppress=True, linewidth=100)
+#
+# print("=== Исходная упругая матрица D_elastic (D^co) ===")
+# print(D_elastic)
+# print("-" * 50)
+#
+# print("=== Проверка состояния на площадке ===")
+# D_ep = model.get_tangent_stiffness_matrix(sigma_tensor, normal_vector, D_elastic)
+# print("-" * 50)
+#
+# print("=== Упруго-пластическая матрица D_ep (после снижения жесткости) ===")
+# print(D_ep)
+# print("-" * 50)
+#
+# print("=== Разница (Матрица падения жесткости D_plastic) ===")
+# print(D_elastic - D_ep)
+
+
+====================
+File: .\FEM\Integration_Point_Level\CriticalPlane\material.py
+====================
+
+import numpy as np
+from scipy.optimize import minimize, minimize_scalar
+
+
+# ==========================================
+# КЛАСС МАТЕРИАЛА
+# ==========================================
+class Material:
+    """
+    Класс, представляющий ортотропный материал с анизотропным законом трения.
+    Содержит свойства прочности и методы оценки критических плоскостей.
+    """
+
+    def __init__(self, mu=0.3, A_tensor=None, Rpx=None, Rpy=None, Rpz=None,
+                 Rcx=None, Rcy=None, Rcz=None):
+        """
+        Инициализация свойств материала.
+
+        Параметры:
+        ----------
+        mu : float
+            Коэффициент трения (при сжатии, sigma_n < 0)
+        A_tensor : np.ndarray, shape (9,9), optional
+            Тензор анизотропии для вычисления параметра C (сопротивление сдвигу).
+            Если None, принимается единичная матрица.
+        Rpx, Rpy, Rpz : float, optional
+            Пределы прочности на растяжение вдоль осей X, Y, Z.
+        Rcx, Rcy, Rcz : float, optional
+            Пределы прочности на сжатие вдоль осей X, Y, Z.
+        """
+        self.mu = mu
+        self.A_tensor = A_tensor if A_tensor is not None else np.eye(9)
+
+        # Прочности на растяжение (положительные значения)
+        self.Rpx = Rpx if Rpx is not None else 1e9  # по умолчанию очень высокие
+        self.Rpy = Rpy if Rpy is not None else 1e9
+        self.Rpz = Rpz if Rpz is not None else 1e9
+
+        # Прочности на сжатие (положительные значения)
+        self.Rcx = Rcx if Rcx is not None else 1e9
+        self.Rcy = Rcy if Rcy is not None else 1e9
+        self.Rcz = Rcz if Rcz is not None else 1e9
+
+        # Внутренние константы (понижение трения при растяжении)
+        self.mu_tensile = -0.4
+
+
+
+    def get_cohesion(self, n, s):
+        """
+        Вычисляет начальное сцепление на площадке с нормалью n и направлением сдвига s.
+
+        Параметры:
+        n : array_like (3,) — единичный вектор нормали.
+        s : array_like (3,) — единичный вектор направления сдвига в плоскости площадки.
+
+        Возвращает:
+        C : float — начальное сцепление.
+        """
+        n = np.asarray(n, dtype=float)
+        s = np.asarray(s, dtype=float)
+        # Нормализация на всякий случай
+        n = n / np.linalg.norm(n)
+        s = s / np.linalg.norm(s)
+
+        v = np.outer(n, s).reshape(9)
+        C_sq = v @ self.A_tensor @ v
+        C_sq = max(0.0, C_sq)
+        return np.sqrt(C_sq)
+
+def load_tensor_from_string(tensor_str):
+    lines = tensor_str.strip().split('\n')
+    data_lines = [line for line in lines if line.strip() and not line.strip().startswith('#')]
+    matrix = []
+    for line in data_lines:
+        row = [float(x) for x in line.split()]
+        matrix.append(row)
+    return np.array(matrix)
+
+
+
+====================
+File: .\FEM\Integration_Point_Level\CriticalPlane\model_Plane.py
+====================
+
+import math
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd  # ДОБАВЛЕНО: импорт pandas для сохранения в Excel
+import material as mt
+import criterion as cr
+
+# Настройки лучей
+from tensor import StressTensor
+
+NUM_RAYS = 120  # количество лучей на 360 градусов
+MAX_DIST = 20.0  # максимальная дальность луча
+STEP = 0.05  # шаг движения вдоль луча
+
+# ДОБАВЛЕНО: Выносим угол в отдельную переменную, чтобы использовать ее и для расчетов, и для имени листа
+CURRENT_ALPHA_DEG = 90
+
+tensor_data = """
+0.900000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+0.000000 0.399714 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+0.000000 0.000000 0.900000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+0.000000 0.000000 0.000000 0.399994 0.000000 0.000000 0.000000 0.000000 0.000000
+0.000000 0.000000 0.000000 0.000000 0.396589 0.000000 0.000000 0.000000 0.000000
+0.000000 0.000000 0.000000 0.000000 0.000000 0.396613 0.000000 0.000000 0.000000
+0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.544270 0.000000 0.000000
+0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.400018 0.000000
+0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.900000
+                """
+A_matrix = mt.load_tensor_from_string(tensor_data)
+material = mt.Material(
+    mu=-0.7,
+    A_tensor=A_matrix,
+    Rpx=0.3, Rpy=0.3, Rpz=0.15,
+    Rcx=10.0, Rcy=10.0, Rcz=8.5
+)
+my_material = material
+
+
+def is_inside(x, y, alpha_deg=CURRENT_ALPHA_DEG):
+    sigma_1 = x
+    sigma_2 = y
+
+    alpha = math.radians(alpha_deg)
+    c = math.cos(alpha)
+    s = math.sin(alpha)
+
+    sigma_x = sigma_1 * c ** 2 + sigma_2 * s ** 2
+    sigma_z = sigma_1 * s ** 2 + sigma_2 * c ** 2
+    tau_xz = -(sigma_1 - sigma_2) * s * c
+
+    stress_tensor = StressTensor(sigma_x, 0.0, sigma_z, 0.0, 0.0, tau_xz)
+    f_shear, _, _ = cr.find_critical_plane_shear(stress_tensor, material, mode='2D_XZ')
+    f_comp, _, _ = cr.find_critical_plane_compression(stress_tensor, material, mode='2D_XZ')
+    f_ten, _, _ = cr.find_critical_plane_tensile(stress_tensor, material, mode='3D')
+    overall_max_f = max(f_shear, f_comp, f_ten)
+
+    return overall_max_f >= 0
+
+
+# Сбор точек пересечения лучей с объектами
+intersection_points = []
+
+for i in range(NUM_RAYS):
+    angle = 2 * math.pi * i / NUM_RAYS  # угол в радианах
+    dx = math.cos(angle)
+    dy = math.sin(angle)
+
+    t = STEP
+    found = False
+    while t <= MAX_DIST:
+        x = t * dx
+        y = t * dy
+        # ДОБАВЛЕНО: передаем текущий угол в функцию
+        if is_inside(x, y, CURRENT_ALPHA_DEG):
+            intersection_points.append((x, y))
+            found = True
+            break
+        t += STEP
+
+# --- ДОБАВЛЕННЫЙ БЛОК: СОХРАНЕНИЕ В EXCEL ---
+if intersection_points:
+    # 1. Создаем таблицу (DataFrame) из списка точек
+    df = pd.DataFrame(intersection_points, columns=['sigma_1', 'sigma_2'])
+
+    excel_filename = "Точки_разрушения.xlsx"
+    sheet_name = str(CURRENT_ALPHA_DEG)  # Называем лист по номеру угла
+
+    # 2. Логика сохранения.
+    # Используем ExcelWriter в режиме 'a' (append), чтобы листы не перезаписывали
+    # друг друга, если вы будете запускать скрипт для разных углов.
+    import os
+
+    if os.path.exists(excel_filename):
+        with pd.ExcelWriter(excel_filename, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+    else:
+        df.to_excel(excel_filename, sheet_name=sheet_name, index=False)
+
+    print(f"Точки успешно сохранены в файл '{excel_filename}' на лист '{sheet_name}'")
+else:
+    print("Точки пересечения не найдены, сохранять нечего.")
+# ---------------------------------------------
+
+
+# Визуализация
+plt.figure(figsize=(8, 8))
+
+# Рисуем сохранённые точки
+if intersection_points:
+    xs, ys = zip(*intersection_points)
+    plt.scatter(xs, ys, c='red', s=30, label='Точки пересечения')
+
+# Также можно нарисовать несколько лучей (каждый 4-й для наглядности)
+for i in range(0, NUM_RAYS, max(1, NUM_RAYS // 20)):
+    angle = 2 * math.pi * i / NUM_RAYS
+    dx = math.cos(angle)
+    dy = math.sin(angle)
+    # Рисуем луч до максимальной дальности
+    plt.plot([0, dx * MAX_DIST], [0, dy * MAX_DIST], color='gray', linewidth=0.5, alpha=0.5)
+
+# Настройки графика
+plt.axhline(0, color='black', linewidth=0.5)
+plt.axvline(0, color='black', linewidth=0.5)
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.axis('equal')
+plt.title(f'Лучи из начала координат ({NUM_RAYS} лучей), Угол = {CURRENT_ALPHA_DEG}°')
+plt.legend()
+plt.show()
+
+
+====================
+File: .\FEM\Integration_Point_Level\CriticalPlane\tensor.py
+====================
+
+import numpy as np
+from scipy.optimize import minimize, minimize_scalar
+
+
+# ==========================================
+# КЛАСС ТЕНЗОРА НАПРЯЖЕНИЙ
+# ==========================================
+class StressTensor:
+    """
+    Тензор напряжений в трёхмерном пространстве.
+    Хранит матрицу 3x3 и предоставляет методы для вычисления напряжений на заданной площадке.
+    """
+
+    def __init__(self, sigma_xx, sigma_yy, sigma_zz, tau_xy, tau_yz, tau_xz):
+        """
+        Инициализация тензора компонентами напряжений.
+        """
+        self.matrix = np.array([
+            [sigma_xx, tau_xy, tau_xz],
+            [tau_xy, sigma_yy, tau_yz],
+            [tau_xz, tau_yz, sigma_zz]
+        ])
+
+    @classmethod
+    def from_matrix(cls, matrix):
+        """
+        Альтернативный конструктор: принимает готовую матрицу 3x3.
+        """
+        if matrix.shape != (3, 3):
+            raise ValueError("Матрица должна быть размером 3x3")
+        if not np.allclose(matrix, matrix.T):
+            raise ValueError("Матрица должна быть симметричной")
+        # Извлекаем компоненты
+        sigma_xx = matrix[0, 0]
+        sigma_yy = matrix[1, 1]
+        sigma_zz = matrix[2, 2]
+        tau_xy = matrix[0, 1]
+        tau_yz = matrix[1, 2]
+        tau_xz = matrix[0, 2]
+        return cls(sigma_xx, sigma_yy, sigma_zz, tau_xy, tau_yz, tau_xz)
+
+    @classmethod
+    def from_string(cls, tensor_str):
+        """
+        Загрузка тензора из строки (формат: три строки по три числа).
+        """
+        lines = tensor_str.strip().split('\n')
+        data_lines = [line for line in lines if line.strip() and not line.strip().startswith('#')]
+        matrix = []
+        for line in data_lines:
+            row = [float(x) for x in line.split()]
+            matrix.append(row)
+        matrix = np.array(matrix)
+        return cls.from_matrix(matrix)
+
+    @classmethod
+    def from_principal_2d(cls, sigma_1, sigma_2, alpha):
+        """
+        Создает тензор напряжений в осях анизотропии для плоского напряженного состояния (в плоскости XZ).
+        sigma_1, sigma_2 - главные напряжения
+        alpha - угол между осью 1 и осью X анизотропии (в радианах).
+        """
+        sigma_xx = (sigma_1 + sigma_2) / 2 + (sigma_1 - sigma_2) / 2 * np.cos(2 * alpha)
+        sigma_zz = (sigma_1 + sigma_2) / 2 - (sigma_1 - sigma_2) / 2 * np.cos(2 * alpha)
+        tau_xz = (sigma_1 - sigma_2) / 2 * np.sin(2 * alpha)
+        return cls(sigma_xx, 0.0, sigma_zz, 0.0, 0.0, tau_xz)
+
+    def to_principal_2d(self):
+        """
+        Возвращает два главных напряжения и угол анизотропии для плоского напряженного состояния (в плоскости XZ).
+        Возвращает: (sigma_1, sigma_2, alpha)
+        """
+        sigma_xx = self.matrix[0, 0]
+        sigma_zz = self.matrix[2, 2]
+        tau_xz = self.matrix[0, 2]
+
+        center = (sigma_xx + sigma_zz) / 2
+        radius = np.sqrt(((sigma_xx - sigma_zz) / 2) ** 2 + tau_xz ** 2)
+
+        sigma_1 = center + radius
+        sigma_2 = center - radius
+
+        alpha = 0.5 * np.arctan2(2 * tau_xz, sigma_xx - sigma_zz)
+        return sigma_1, sigma_2, alpha
+
+    def traction(self, n):
+        """
+        Вектор напряжений на площадке с нормалью n (3‑элементный массив).
+        t = sigma · n
+        """
+        return self.matrix @ n
+
+    def normal_stress(self, n):
+        """
+        Нормальное напряжение на площадке: σ_n = n·(σ·n)
+        """
+        t = self.traction(n)
+        return np.dot(n, t)
+
+    def shear_stress_vector(self, n):
+        """
+        Вектор касательного напряжения: τ = t - σ_n·n
+        """
+        t = self.traction(n)
+        sigma_n = self.normal_stress(n)
+        return t - sigma_n * n
+
+    def shear_stress_magnitude(self, n):
+        """
+        Модуль касательного напряжения: |τ|
+        """
+        tau_vec = self.shear_stress_vector(n)
+        return np.linalg.norm(tau_vec)
+
+
+# ==========================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ==========================================
+def get_normal_vector(params, mode):
+    """
+    Возвращает вектор нормали n в зависимости от режима.
+    Для '2D_XZ': params = [alpha], угол в плоскости XZ.
+    Для '3D': params = [theta, phi].
+    """
+    if mode == '2D_XZ':
+        alpha = params[0] if isinstance(params, (list, tuple, np.ndarray)) else params
+        nx = np.cos(alpha)
+        ny = 0.0
+        nz = np.sin(alpha)
+    else:  # 3D
+        theta, phi = params[0], params[1]
+        nx = np.sin(theta) * np.cos(phi)
+        ny = np.sin(theta) * np.sin(phi)
+        nz = np.cos(theta)
+    return np.array([nx, ny, nz])
+
+
+
 
 ====================
 File: .\FEM\Structure_Level\LinearStaticControl.py
 ====================
 
+# ====================================
+# File: .\FEM\Structure_Level\LinearStaticControl.py
+# ====================================
 import numpy as np
-from Abstract.Element_Level import *
-from Abstract.Structure_Level import *
-from Abstract.Integration_Point_Level import *
+from FEM.Abstract.Structure_Level import Control
+
 
 class LinearStaticControl(Control):
-    """Линейный статический расчет (наследник Control -> Equilibrium Path)"""
+    """Линейный статический расчет"""
+
+    def _apply_bcs(self):
+        """Применяет нагрузки и кинематические граничные условия к глобальным матрицам"""
+
+        # 1. Применяем узловые силы к вектору F_global
+        for load in self.model.nodal_loads:
+            global_dof = load.node.dofs[load.dof_axis]
+            self.model.F_global[global_dof] += load.value
+
+        # 2. Корректируем правую часть (вектор F) для всех кинематических ГУ
+        # Это необходимо, если заданы ненулевые перемещения (осадка опор и т.д.)
+        for bc in self.model.bcs:
+            global_dof = bc.node.dofs[bc.dof_axis]
+            prescribed_value = bc.value
+            if prescribed_value != 0.0:
+                # F = F - K_col * U_prescribed
+                self.model.F_global -= self.model.K_global[:, global_dof] * prescribed_value
+
+        # 3. Модифицируем матрицу K_global (зануляем строки/столбцы, ставим 1 на диагональ)
+        for bc in self.model.bcs:
+            global_dof = bc.node.dofs[bc.dof_axis]
+            prescribed_value = bc.value
+
+            # Зануляем строку и столбец
+            self.model.K_global[global_dof, :] = 0.0
+            self.model.K_global[:, global_dof] = 0.0
+
+            # Ставим 1.0 на главную диагональ и заданное значение в вектор сил
+            self.model.K_global[global_dof, global_dof] = 1.0
+            self.model.F_global[global_dof] = prescribed_value
 
     def solve(self):
         print("Инициализация модели...")
         self.model.initialize()
 
-        print("Сборка глобальных матриц...")
+        print("Сборка глобальной матрицы жесткости...")
         self.model.assemble()
 
-        print("Учет граничных условий и решение СЛАУ...")
-        # Применение закреплений
-        # U = np.linalg.solve(self.model.K_global, self.model.F_global)
+        print("Применение граничных условий и нагрузок...")
+        self._apply_bcs()
+
+        print("Решение СЛАУ...")
+        # Решаем систему уравнений [K] {U} = {F}
+        U = np.linalg.solve(self.model.K_global, self.model.F_global)
 
         print("Обновление перемещений в узлах...")
-        # self.model.update_displacements(U)
+        for node in self.model.nodes:
+            # Извлекаем перемещения для конкретного узла по его глобальным dofs
+            node.displacements = U[node.dofs]
+
+        print("Расчет успешно завершен!")
 
 
 ====================
-File: .\FEM\Structure_Level\NonLinear_NewtonRaphson.py
+File: .\FEM\Structure_Level\NonLinearNewtonRaphsonControl.py
 ====================
 
 import numpy as np
-from Abstract.Element_Level import *
-from Abstract.Structure_Level import *
-from Abstract.Integration_Point_Level import *
+from FEM.Abstract.Structure_Level import Control
 
 
-class NewtonRaphsonControl(Control):
-    def __init__(self, model: FEModel, tolerance=1e-6, max_iter=20):
+class NonLinearNewtonRaphsonControl(Control):
+    def __init__(self, model, num_steps=10, tol=1e-4, max_iter=20):
         super().__init__(model)
-        self.tolerance = tolerance
+        self.num_steps = num_steps
+        self.tol = tol
         self.max_iter = max_iter
 
     def solve(self):
+        print("Инициализация модели...")
         self.model.initialize()
 
-        # Вектор внешних сил F_ext (постоянный для данного шага нагружения)
-        F_ext = self.model.assemble_external_forces()
+        total_dofs = self.model.total_dofs
+        U_global = np.zeros(total_dofs)
 
-        for iteration in range(self.max_iter):
-            # 1. Сборка вектора внутренних сил F_int(U) и касательной матрицы K_T(U)
-            F_int = self.model.assemble_internal_forces()
-            K_T = self.model.assemble_tangent_stiffness()
+        F_ext_ref = np.zeros(total_dofs)
+        for load in self.model.nodal_loads:
+            F_ext_ref[load.node.dofs[load.dof_axis]] += load.value
 
-            # 2. Вычисление вектора невязки (Residual)
-            R = F_ext - F_int
+        print(f"Начало нелинейного расчета: {self.num_steps} шагов.")
 
-            # Учет граничных условий в K_T и R...
-            self.apply_bcs(K_T, R)
+        for step in range(1, self.num_steps + 1):
+            load_factor = step / self.num_steps
+            F_ext_current = F_ext_ref * load_factor
 
-            # 3. Проверка сходимости
-            if np.linalg.norm(R) < self.tolerance:
-                print(f"Сходимость достигнута за {iteration} итераций!")
-                # Обновляем внутренние переменные материала (например, пластичность)
-                self.model.commit_material_state()
-                break
+            print(f"\n--- Шаг нагрузки {step}/{self.num_steps} (Load Factor = {load_factor:.2f}) ---")
 
-            # 4. Решение системы для приращений перемещений
-            delta_U = np.linalg.solve(K_T, R)
+            for iteration in range(self.max_iter):
+                K_t = np.zeros((total_dofs, total_dofs))
+                F_int = np.zeros(total_dofs)
 
-            # 5. Обновление перемещений
-            self.model.update_displacements(delta_U)
+                for element in self.model.elements:
+                    el_dofs = []
+                    for node in element.nodes:
+                        el_dofs.extend(node.dofs)
+                    U_el = U_global[el_dofs]
+
+                    K_e, F_int_e = self._compute_element_nonlinear(element, U_el)
+
+                    K_t[np.ix_(el_dofs, el_dofs)] += K_e
+                    F_int[el_dofs] += F_int_e
+
+                Residual = F_ext_current - F_int
+
+                for bc in self.model.bcs:
+                    dof = bc.node.dofs[bc.dof_axis]
+                    val = bc.value * load_factor if iteration == 0 else 0.0
+
+                    K_t[dof, :] = 0.0
+                    K_t[:, dof] = 0.0
+                    K_t[dof, dof] = 1.0
+                    Residual[dof] = val
+
+                free_dofs = [i for i in range(total_dofs) if K_t[i, i] != 1.0 or Residual[i] != 0.0]
+                error = np.linalg.norm(Residual[free_dofs]) if len(free_dofs) > 0 else 0.0
+
+                print(f"  Итерация {iteration}: Ошибка = {error:.6e}")
+
+                if np.isnan(error) or np.isinf(error):
+                    print("КРИТИЧЕСКАЯ ОШИБКА: Решение разошлось (NaN/Inf).")
+                    return
+
+                if error < self.tol and iteration > 0:
+                    print("  Сходимость достигнута!")
+                    self._commit_state()
+                    break
+
+                dU = np.linalg.solve(K_t, Residual)
+                U_global += dU
+
+            else:
+                print("ВНИМАНИЕ: Сходимость не достигнута за максимальное число итераций! Сохраняем как есть.")
+                self._commit_state()
+
+        for node in self.model.nodes:
+            node.displacements = U_global[node.dofs]
+        print("\nРасчет успешно завершен!")
+
+    def _commit_state(self):
+        """Фиксирует историю деформаций во всех точках Гаусса"""
+        for element in self.model.elements:
+            for ip in element.integration_points:
+                if hasattr(ip.constitutive_model, 'commit'):
+                    ip.constitutive_model.commit()
+
+    def _compute_element_nonlinear(self, element, U_el):
+        ndof = len(U_el)
+        K_e = np.zeros((ndof, ndof))
+        F_int_e = np.zeros(ndof)
+        node_coords = np.array([node.coords for node in element.nodes])
+
+        for ip in element.integration_points:
+            _, detJ = element.shape.get_jacobian(ip.coords, node_coords)
+            dN_dx = element.shape.get_shape_derivatives_cartesian(ip.coords, node_coords)
+            B = element.analysis_model.get_B_matrix(dN_dx)
+            h = element.analysis_model.get_h_coefficient()
+            dV = detJ * h * ip.weight
+
+            # Передаем ПОЛНУЮ текущую деформацию узлов.
+            # Модель сама найдет разницу с сохраненным шагом.
+            current_strain = B @ U_el
+            stress, D_ep = ip.constitutive_model.update_state(current_strain)
+
+            K_e += B.T @ D_ep @ B * dV
+            F_int_e += B.T @ stress * dV
+
+        return K_e, F_int_e
+
+
+====================
+File: .\FEM\Structure_Level\VTKExporter.py
+====================
+
+# ====================================
+# File: .\FEM\Structure_Level\VTK_Exporter.py
+# ====================================
+import os
+
+
+class VTKExporter:
+    """Класс для экспорта результатов МКЭ в формат Legacy VTK (.vtk)"""
+
+    @staticmethod
+    def export(model, filename="results.vtk"):
+        print(f"Экспорт результатов в {filename}...")
+
+        num_nodes = len(model.nodes)
+        num_elements = len(model.elements)
+
+        if num_nodes == 0 or num_elements == 0:
+            print("Ошибка: Модель пуста. Экспорт отменен.")
+            return
+
+        # Создаем словарь для маппинга ID узлов в последовательные индексы (0, 1, 2...)
+        # VTK требует строгую нумерацию с нуля.
+        node_to_index = {node.id: idx for idx, node in enumerate(model.nodes)}
+
+        with open(filename, "w", encoding="utf-8") as f:
+            # 1. Заголовок VTK файла
+            f.write("# vtk DataFile Version 3.0\n")
+            f.write("FEM 3D Results\n")
+            f.write("ASCII\n")
+            f.write("DATASET UNSTRUCTURED_GRID\n\n")
+
+            # 2. Запись координат узлов (POINTS)
+            f.write(f"POINTS {num_nodes} float\n")
+            for node in model.nodes:
+                coords = node.coords
+                # VTK всегда ожидает 3 координаты (X, Y, Z)
+                x = coords[0] if len(coords) > 0 else 0.0
+                y = coords[1] if len(coords) > 1 else 0.0
+                z = coords[2] if len(coords) > 2 else 0.0
+                f.write(f"{x:.6f} {y:.6f} {z:.6f}\n")
+
+            # 3. Запись топологии элементов (CELLS)
+            # Формат: <кол-во узлов в элементе> <индекс_узла_1> ... <индекс_узла_N>
+            # Считаем общий размер списка ячеек: (кол-во узлов + 1) для каждого элемента
+            total_list_size = sum(len(el.nodes) + 1 for el in model.elements)
+            f.write(f"\nCELLS {num_elements} {total_list_size}\n")
+
+            for el in model.elements:
+                n_nodes = len(el.nodes)
+                # Получаем последовательные индексы узлов
+                indices = [str(node_to_index[node.id]) for node in el.nodes]
+                f.write(f"{n_nodes} " + " ".join(indices) + "\n")
+
+            # 4. Запись типов элементов (CELL_TYPES)
+            f.write(f"\nCELL_TYPES {num_elements}\n")
+            for el in model.elements:
+                n_nodes = len(el.nodes)
+                # 12 = VTK_HEXAHEDRON (8 узлов)
+                # 9  = VTK_QUAD (4 узла)
+                if n_nodes == 8:
+                    vtk_type = 12
+                elif n_nodes == 4:
+                    vtk_type = 9
+                else:
+                    vtk_type = 1  # Неизвестный тип (Vertex)
+                f.write(f"{vtk_type}\n")
+
+            # 5. Запись узловых результатов (POINT_DATA)
+            f.write(f"\nPOINT_DATA {num_nodes}\n")
+
+            # Векторное поле: Перемещения
+            f.write("VECTORS Displacements float\n")
+            for node in model.nodes:
+                disp = node.displacements
+                u = disp[0] if len(disp) > 0 else 0.0
+                v = disp[1] if len(disp) > 1 else 0.0
+                w = disp[2] if len(disp) > 2 else 0.0
+                f.write(f"{u:.6e} {v:.6e} {w:.6e}\n")
+
+        print("Готово!")
 
 
 ====================
@@ -615,379 +1690,80 @@ File: .\Tests\1.py
 ====================
 
 import numpy as np
-from abc import ABC, abstractmethod
+import FEM.Integration_Point_Level.CriticalPlane.material as mt
 
-
-# =====================================================================
-# 1. ФИЗИКА (НЕЛИНЕЙНЫЙ МАТЕРИАЛ)
-# =====================================================================
-class Material:
-    def __init__(self, E, nu, eps_0=None):
-        self.E = E
-        self.nu = nu
-        self.eps_0 = eps_0  # Предел упругости (для нелинейной модели)
-
-
-class ConstitutiveModel(ABC):
-    def __init__(self, material):
-        self.material = material
-
-    @abstractmethod
-    def get_tangent_matrix(self, strain): pass
-
-    @abstractmethod
-    def get_stress(self, strain): pass
-
-
-class IsotropicDamageModel(ConstitutiveModel):
-    """Нелинейная модель: жесткость падает при превышении деформации eps_0"""
-
-    def _get_elastic_matrix(self):
-        E, nu = self.material.E, self.material.nu
-        factor = E / (1 - nu ** 2)
-        return factor * np.array([
-            [1, nu, 0],
-            [nu, 1, 0],
-            [0, 0, (1 - nu) / 2]
-        ])
-
-    def get_stress(self, strain):
-        D0 = self._get_elastic_matrix()
-        eps_eq = np.linalg.norm(strain)  # Эквивалентная деформация
-
-        if eps_eq <= self.material.eps_0 or eps_eq == 0:
-            # Линейно-упругая зона
-            return D0 @ strain
-        else:
-            # Зона повреждения (напряжения растут медленнее)
-            damage_factor = self.material.eps_0 / eps_eq
-            return damage_factor * (D0 @ strain)
-
-    def get_tangent_matrix(self, strain):
-        D0 = self._get_elastic_matrix()
-        eps_eq = np.linalg.norm(strain)
-
-        if eps_eq <= self.material.eps_0 or eps_eq == 0:
-            # Касательная матрица равна начальной
-            return D0
-        else:
-            # Аналитическая касательная матрица для метода Ньютона-Рафсона (D_t = d_sigma / d_epsilon)
-            I = np.eye(3)
-            outer_strain = np.outer(strain, strain)
-            damage_factor = self.material.eps_0 / eps_eq
-            return damage_factor * D0 @ (I - outer_strain / (eps_eq ** 2))
-
-
-class IntegrationPoint:
-    def __init__(self, xi, eta, weight, constitutive_model):
-        self.xi, self.eta, self.weight = xi, eta, weight
-        self.constitutive_model = constitutive_model
-
-
-# =====================================================================
-# 2. ГЕОМЕТРИЯ И АНАЛИЗ (БЕЗ ИЗМЕНЕНИЙ!)
-# =====================================================================
-class Shape(ABC):
-    @abstractmethod
-    def get_jacobian(self, xi, eta, node_coords): pass
-
-    @abstractmethod
-    def get_shape_derivatives_cartesian(self, xi, eta, node_coords): pass
-
-
-class Quadrilateral4Node(Shape):
-    def get_jacobian(self, xi, eta, node_coords):
-        dN_dxi_eta = 0.25 * np.array([[-(1 - eta), (1 - eta), (1 + eta), -(1 + eta)],
-                                      [-(1 - xi), -(1 + xi), (1 + xi), (1 - xi)]])
-        J = dN_dxi_eta @ node_coords
-        return J, np.linalg.det(J), dN_dxi_eta
-
-    def get_shape_derivatives_cartesian(self, xi, eta, node_coords):
-        J, _, dN_dxi_eta = self.get_jacobian(xi, eta, node_coords)
-        return np.linalg.inv(J) @ dN_dxi_eta
-
-
-class AnalysisModel(ABC):
-    @abstractmethod
-    def get_B_matrix(self, shape_derivatives): pass
-
-    @abstractmethod
-    def get_h_coefficient(self): pass
-
-
-class PlaneStress2DModel(AnalysisModel):
-    def __init__(self, thickness): self.thickness = thickness
-
-    def get_B_matrix(self, dN_dx_dy):
-        n = dN_dx_dy.shape[1]
-        B = np.zeros((3, n * 2))
-        for i in range(n):
-            B[0, 2 * i], B[1, 2 * i + 1] = dN_dx_dy[0, i], dN_dx_dy[1, i]
-            B[2, 2 * i], B[2, 2 * i + 1] = dN_dx_dy[1, i], dN_dx_dy[0, i]
-        return B
-
-    def get_h_coefficient(self): return self.thickness
-
-
-# =====================================================================
-# 3. ЭЛЕМЕНТ (ДОБАВЛЕНЫ НЕЛИНЕЙНЫЕ МЕТОДЫ)
-# =====================================================================
-class Element:
-    def __init__(self, nodes, shape, analysis_model, integration_points):
-        self.nodes, self.shape = nodes, shape
-        self.analysis_model, self.integration_points = analysis_model, integration_points
-
-    def _get_u_e(self):
-        """Возвращает текущий вектор перемещений узлов элемента"""
-        u_e = np.zeros(len(self.nodes) * 2)
-        for i, node in enumerate(self.nodes):
-            u_e[2 * i], u_e[2 * i + 1] = node.displacements[0], node.displacements[1]
-        return u_e
-
-    def compute_internal_forces(self):
-        """Интегрирование напряжений: F_int = integral( B^T * sigma * |J| * h * W )"""
-        node_coords = np.array([n.coords for n in self.nodes])
-        u_e = self._get_u_e()
-        F_int = np.zeros(len(u_e))
-
-        for ip in self.integration_points:
-            _, detJ, _ = self.shape.get_jacobian(ip.xi, ip.eta, node_coords)
-            dN_dx = self.shape.get_shape_derivatives_cartesian(ip.xi, ip.eta, node_coords)
-            B = self.analysis_model.get_B_matrix(dN_dx)
-
-            strain = B @ u_e
-            stress = ip.constitutive_model.get_stress(strain)
-
-            F_int += B.T @ stress * detJ * self.analysis_model.get_h_coefficient() * ip.weight
-        return F_int
-
-    def compute_tangent_stiffness(self):
-        """Касательная матрица жесткости: K_T = integral( B^T * D_T * B * |J| * h * W )"""
-        node_coords = np.array([n.coords for n in self.nodes])
-        u_e = self._get_u_e()
-        ndof = len(u_e)
-        K_T = np.zeros((ndof, ndof))
-
-        for ip in self.integration_points:
-            _, detJ, _ = self.shape.get_jacobian(ip.xi, ip.eta, node_coords)
-            dN_dx = self.shape.get_shape_derivatives_cartesian(ip.xi, ip.eta, node_coords)
-            B = self.analysis_model.get_B_matrix(dN_dx)
-
-            strain = B @ u_e
-            D_t = ip.constitutive_model.get_tangent_matrix(strain)
-
-            K_T += B.T @ D_t @ B * detJ * self.analysis_model.get_h_coefficient() * ip.weight
-        return K_T
-
-
-# =====================================================================
-# 4. ГЛОБАЛЬНАЯ МОДЕЛЬ И НЕЛИНЕЙНЫЙ РЕШАТЕЛЬ (NEWTON-RAPHSON)
-# =====================================================================
-class Node:
-    def __init__(self, id, coords):
-        self.id, self.coords = id, np.array(coords, dtype=float)
-        self.dofs, self.forces, self.is_fixed = [], np.zeros(2), [False, False]
-        self.displacements = np.zeros(2)  # Хранит текущие полные перемещения!
-
-
-class FEModel:
-    def __init__(self):
-        self.nodes, self.elements = [], []
-        self.total_dofs = 0
-
-    def initialize(self):
-        self.total_dofs = len(self.nodes) * 2
-        dof_counter = 0
-        for node in self.nodes:
-            node.dofs = [dof_counter, dof_counter + 1]
-            dof_counter += 2
-
-    def assemble_external_forces(self):
-        F_ext = np.zeros(self.total_dofs)
-        for node in self.nodes:
-            F_ext[node.dofs[0]] += node.forces[0]
-            F_ext[node.dofs[1]] += node.forces[1]
-        return F_ext
-
-    def assemble_internal_forces(self):
-        F_int = np.zeros(self.total_dofs)
-        for el in self.elements:
-            f_e = el.compute_internal_forces()
-            dofs = [d for node in el.nodes for d in node.dofs]
-            for i, gdof in enumerate(dofs):
-                F_int[gdof] += f_e[i]
-        return F_int
-
-    def assemble_tangent_stiffness(self):
-        K_T = np.zeros((self.total_dofs, self.total_dofs))
-        for el in self.elements:
-            k_e = el.compute_tangent_stiffness()
-            dofs = [d for node in el.nodes for d in node.dofs]
-            for i, gi in enumerate(dofs):
-                for j, gj in enumerate(dofs):
-                    K_T[gi, gj] += k_e[i, j]
-        return K_T
-
-    def update_displacements(self, delta_U):
-        for node in self.nodes:
-            node.displacements[0] += delta_U[node.dofs[0]]
-            node.displacements[1] += delta_U[node.dofs[1]]
-
-
-class NewtonRaphsonControl:
-    def __init__(self, model: FEModel, tol=1e-6, max_iter=15):
-        self.model, self.tol, self.max_iter = model, tol, max_iter
-
-    def solve(self):
-        self.model.initialize()
-        F_ext = self.model.assemble_external_forces()
-
-        print(f"{'Итерация':<10} | {'Норма невязки ||R||':<20}")
-        print("-" * 35)
-
-        for iteration in range(1, self.max_iter + 1):
-            F_int = self.model.assemble_internal_forces()
-            K_T = self.model.assemble_tangent_stiffness()
-
-            # Вектор невязки (Residual) R = F_ext - F_int
-            R = F_ext - F_int
-
-            # Учет граничных условий
-            for node in self.model.nodes:
-                for i in range(2):
-                    if node.is_fixed[i]:
-                        gdof = node.dofs[i]
-                        K_T[gdof, :] = 0
-                        K_T[:, gdof] = 0
-                        K_T[gdof, gdof] = 1.0
-                        R[gdof] = 0.0  # Невязка в закреплениях равна 0
-
-            # Проверка сходимости
-            residual_norm = np.linalg.norm(R)
-            print(f"{iteration:<10} | {residual_norm:.6e}")
-
-            if residual_norm < self.tol:
-                print("-" * 35)
-                print(f"УСПЕХ: Сходимость достигнута за {iteration - 1} итераций!\n")
-                break
-
-            # Решение СЛАУ для приращений: K_T * delta_U = R
-            delta_U = np.linalg.solve(K_T, R)
-
-            # Обновление перемещений
-            self.model.update_displacements(delta_U)
-        else:
-            print("ОШИБКА: Решатель не сошелся!")
-
-
-# =====================================================================
-# 5. ФАБРИКА ЭЛЕМЕНТОВ
-# =====================================================================
-class ElementFactory:
-    def create_q4_damage_element(self, nodes, material, thickness):
-        shape = Quadrilateral4Node()
-        analysis = PlaneStress2DModel(thickness)
-
-        g = 1.0 / np.sqrt(3.0)
-        points = []
-        for xi, eta in [(-g, -g), (g, -g), (g, g), (-g, g)]:
-            physics = IsotropicDamageModel(material)
-            points.append(IntegrationPoint(xi, eta, 1.0, physics))
-
-        return Element(nodes, shape, analysis, points)
-
-
-# =====================================================================
-# 6. MAIN (ЗАПУСК)
-# =====================================================================
-def main():
-    # 1. Узлы (Квадрат 1х1 м)
-    nodes = [Node(1, [0, 0]), Node(2, [1, 0]), Node(3, [1, 1]), Node(4, [0, 1])]
-    nodes[0].is_fixed, nodes[3].is_fixed = [True, True], [True, True]  # Левый край закреплен
-
-    # Прикладываем ОЧЕНЬ большую силу (100 000 Н на правый край)
-    # Это вызовет деформации, сильно превышающие предел упругости eps_0
-    nodes[1].forces[0] = 50000.0
-    nodes[2].forces[0] = 50000.0
-
-    # 2. Нелинейный материал
-    # Сталь: E = 200 ГПа, nu = 0.3. Предел упругой деформации eps_0 = 0.0001 (0.01%)
-    steel_damage = Material(E=2e11, nu=0.3, eps_0=1e-4)
-
-    # 3. Сборка
-    factory = ElementFactory()
-    element = factory.create_q4_damage_element(nodes, steel_damage, thickness=0.01)
-
-    model = FEModel()
-    model.nodes, model.elements = nodes, [element]
-
-    # 4. Запуск МЕТОДА НЬЮТОНА-РАФСОНА
-    solver = NewtonRaphsonControl(model, tol=1e-5)
-    solver.solve()
-
-    # 5. Результаты
-    print("Финальные перемещения узлов (м):")
-    for node in model.nodes:
-        print(f"Узел {node.id}: Ux = {node.displacements[0]:.5e}, Uy = {node.displacements[1]:.5e}")
-
-
-if __name__ == "__main__":
-    main()
-
-
-====================
-File: .\Tests\2.py
-====================
-
-# Предполагаемые импорты на основе структуры файлов
 from FEM.Abstract.Structure_Level import Node, FEModel
 from FEM.Abstract.Integration_Point_Level import Material
-from FEM.Integration_Point_Level.LinElastPlaStr import LinearElasticPlaneStress
-from main import Q4PlaneStressFactory
-from FEM.Structure_Level.LinearStaticControl import LinearStaticControl
+from FEM.Element_Level.Shape8NodeHexahedron import HEX8Factory
+from FEM.Integration_Point_Level.CriticalPlane.CriticalPlanePlasticity3D import CriticalPlanePlasticity3D
+from FEM.Structure_Level.NonLinearNewtonRaphsonControl import NonLinearNewtonRaphsonControl
+from FEM.Structure_Level.VTKExporter import VTKExporter
 
 
-def main():
-    # 1. Определение материала
-    # E - модуль Юнга, nu - коэффициент Пуассона
-    material = Material(E=210000.0, nu=0.3)
+class GlobalMaterial(Material):
+    def __init__(self, E, nu, crit_mat):
+        super().__init__(E, nu)
+        self.crit_mat = crit_mat
 
-    # 2. Создание узлов (координаты X, Y)
+
+def run_nonlinear_fem():
+    print("=== Нелинейный расчет (Единицы: Метры, Меганьютоны, Мегапаскали) ===")
+
     nodes = [
-        Node(id=1, coords=[0.0, 0.0]),
-        Node(id=2, coords=[10.0, 0.0]),
-        Node(id=3, coords=[10.0, 10.0]),
-        Node(id=4, coords=[0.0, 10.0])
+        Node(0, [0.0, 0.0, 0.0]), Node(1, [1.0, 0.0, 0.0]), Node(2, [1.0, 1.0, 0.0]), Node(3, [0.0, 1.0, 0.0]),
+        Node(4, [0.0, 0.0, 1.0]), Node(5, [1.0, 0.0, 1.0]), Node(6, [1.0, 1.0, 1.0]), Node(7, [0.0, 1.0, 1.0]),
+        Node(8, [2.0, 0.0, 0.0]), Node(9, [2.0, 1.0, 0.0]), Node(10, [2.0, 0.0, 1.0]), Node(11, [2.0, 1.0, 1.0])
     ]
 
-    # 3. Создание элемента через Фабрику
-    # Используем Q4PlaneStressFactory из main.py
-    # thickness - толщина элемента
-    factory = Q4PlaneStressFactory(thickness=1.0)
+    tensor_data = """
+    0.900000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+    0.000000 0.399714 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+    0.000000 0.000000 0.900000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+    0.000000 0.000000 0.000000 0.399994 0.000000 0.000000 0.000000 0.000000 0.000000
+    0.000000 0.000000 0.000000 0.000000 0.396589 0.000000 0.000000 0.000000 0.000000
+    0.000000 0.000000 0.000000 0.000000 0.000000 0.396613 0.000000 0.000000 0.000000
+    0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.544270 0.000000 0.000000
+    0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.400018 0.000000
+    0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.900000
+    """
 
-    # Фабрика создает элемент, интеграционные точки и связывает их с моделью анализа
-    element = factory.create_element(nodes, material)
+    # C_val из A_matrix получается около 1.0 (что означает 1.0 МПа)
+    A_matrix = mt.load_tensor_from_string(tensor_data)
+    crit_mat = mt.Material(mu=-0.7, A_tensor=A_matrix)
 
-    # 4. Настройка FEModel
+    # E = 20 ГПа = 20000 МПа
+    material = GlobalMaterial(E=20000.0, nu=0.2, crit_mat=crit_mat)
+    factory = HEX8Factory()
+
+    el1 = factory.create_element(nodes[0:8], material, constitutive_class=CriticalPlanePlasticity3D)
+    el2_nodes = [nodes[1], nodes[8], nodes[9], nodes[2], nodes[5], nodes[10], nodes[11], nodes[6]]
+    el2 = factory.create_element(el2_nodes, material, constitutive_class=CriticalPlanePlasticity3D)
+
     model = FEModel()
+    model.nodes = nodes
+    model.elements = [el1, el2]
+    model.materials = [material]
 
-    # Предполагается, что в FEModel есть методы для добавления узлов и элементов
-    for node in nodes:
-        model.add_node(node)
-    model.add_element(element)
+    for node in [nodes[0], nodes[3], nodes[4], nodes[7]]:
+        model.add_bc(node, 0, 0.0)
+        model.add_bc(node, 1, 0.0)
+        model.add_bc(node, 2, 0.0)
 
-    # Инициализация модели (подготовка матриц жесткости и т.д.)
-    model.initialize()
+    # Сила 100 кН = 0.1 МН. Делим на 4 узла = 0.025 МН на узел.
+    for node in [nodes[8], nodes[9], nodes[10], nodes[11]]:
+        model.add_load(node, 2, -0.025)
 
-    # 5. Решение задачи
-    # Используем LinearStaticControl для линейно-статического анализа
-    solver = LinearStaticControl(model)
+    # Запуск
+    control = NonLinearNewtonRaphsonControl(model, num_steps=10, tol=1e-4)
+    control.solve()
 
-    print("Запуск решения...")
-    solver.solve()
-    print("Решение завершено.")
+    print("\nПеремещения на свободном конце (X=2.0) после нелинейного расчета:")
+    for node in [nodes[8], nodes[9], nodes[10], nodes[11]]:
+        print(f"Узел {node.id}: dZ = {node.displacements[2]:.5e} м")
+
+    VTKExporter.export(model, "nonlinear_beam_results.vtk")
 
 
 if __name__ == "__main__":
-    main()
+    run_nonlinear_fem()
 

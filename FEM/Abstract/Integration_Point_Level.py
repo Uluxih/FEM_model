@@ -26,12 +26,9 @@ class ConstitutiveModel(ABC):
         """Возвращает вектор напряжений (формула 2 в статье)"""
         pass
 
-
 class IntegrationPoint:
-    """Точка интегрирования (хранит локальные координаты, вес и модель материала)"""
-
-    def __init__(self, xi, eta, weight, constitutive_model):
-        self.xi = xi
-        self.eta = eta
+    """Универсальная точка интегрирования"""
+    def __init__(self, coords, weight, constitutive_model):
+        self.coords = coords  # Универсальные координаты: [xi, eta, zeta]
         self.weight = weight
-        self.constitutive_model = constitutive_model  # Ссылка на Constitutive Model
+        self.constitutive_model = constitutive_model
