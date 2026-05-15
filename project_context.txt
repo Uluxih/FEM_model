@@ -767,7 +767,6 @@ import numpy as np
 from FEM.Abstract.Integration_Point_Level import ConstitutiveModel
 from FEM.Integration_Point_Level.CriticalPlane.tensor import StressTensor
 from FEM.Integration_Point_Level.CriticalPlane import criterion as cr
-from FEM.Integration_Point_Level.CriticalPlane.GetMatrByPlane import PlanePlasticityModel
 
 
 class CriticalPlanePlasticity3D(ConstitutiveModel):
@@ -784,21 +783,29 @@ class CriticalPlanePlasticity3D(ConstitutiveModel):
         G = E / (2 * (1 + nu))
         self.D_e[3, 3] = self.D_e[4, 4] = self.D_e[5, 5] = G
 
-        # --- СОСТОЯНИЕ ПРОШЛОГО СОШЕДШЕГОСЯ ШАГА (_old) ---
         self.stress_old = np.zeros(6)
         self.strain_old = np.zeros(6)
         self.kappa_old = 0.0
         self.is_cracked_old = False
         self.fixed_normal_old = None
 
-        # --- ТЕКУЩЕЕ (ПРОБНОЕ) СОСТОЯНИЕ В ИТЕРАЦИЯХ ---
         self.stress = np.zeros(6)
         self.strain = np.zeros(6)
         self.kappa = 0.0
         self.is_cracked = False
         self.fixed_normal = None
 
-        self.plane_model = PlanePlasticityModel(hardening_type='cohesion')
+        # --- ПАРАМЕТРЫ ВАШЕЙ МОДЕЛИ УПРОЧНЕНИЯ ---
+        self.hardening_type = 'cohesion'  # или 'friction'
+        self.c_fixed = 2.0
+        self.mu_c = 0.6
+        self.A_mu = 0.005
+        self.mu_fixed = 0.4
+        self.c_0 = 1.0
+        self.c_u = 4.0
+        self.A_c = 10000.001
+        self.sigma_0 = 1.0
+        self.eta_c = -0.4
 
     def _voigt_to_tensor(self, v):
         return np.array([
@@ -807,6 +814,54 @@ class CriticalPlanePlasticity3D(ConstitutiveModel):
             [v[5], v[4], v[2]]
         ])
 
+    def _get_stress_on_plane(self, stress_voigt, normal):
+        st_obj = StressTensor.from_matrix(self._voigt_to_tensor(stress_voigt))
+        sigma_n = st_obj.normal_stress(normal)
+        tau_n = st_obj.shear_stress_magnitude(normal)
+
+        if tau_n > 1e-12:
+            s_geom = st_obj.shear_stress_vector(normal) / tau_n
+        else:
+            s_geom = np.array([1.0, 0.0, 0.0]) if abs(normal[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+            s_geom = s_geom - np.dot(s_geom, normal) * normal
+            s_geom /= np.linalg.norm(s_geom)
+
+        return sigma_n, tau_n, s_geom
+
+    def _get_friction_and_hardening(self, kappa):
+        mu = self.mu_c * kappa / (self.A_mu + kappa)
+        dmu_dkappa = self.mu_c * self.A_mu / ((self.A_mu + kappa) ** 2)
+        return mu, dmu_dkappa
+
+    def _get_cohesion_and_hardening(self, kappa):
+        c = self.c_0 + (self.c_u - self.c_0) * kappa / (self.A_c + kappa)
+        dc_dkappa = (self.c_u - self.c_0) * self.A_c / ((self.A_c + kappa) ** 2)
+        return c, dc_dkappa
+
+    def _get_gradients_voigt(self, n, s, mu_fric, sigma_n, tau):
+        N_tens = np.outer(n, n)
+        S_tens = 0.5 * (np.outer(n, s) + np.outer(s, n))
+
+        df_dsigma_tens = mu_fric * N_tens + S_tens
+
+        # ЗАЩИТА 1: От сингулярности при сильном растяжении
+        denom = self.sigma_0 - sigma_n
+        if denom < 1e-4:
+            denom = 1e-4
+
+        dpsi_dsigma_scalar = (tau / denom) - self.eta_c
+        dpsi_dsigma_tens = dpsi_dsigma_scalar * N_tens + S_tens
+
+        q = np.array([
+            df_dsigma_tens[0, 0], df_dsigma_tens[1, 1], df_dsigma_tens[2, 2],
+            2.0 * df_dsigma_tens[0, 1], 2.0 * df_dsigma_tens[1, 2], 2.0 * df_dsigma_tens[0, 2]
+        ])
+        r = np.array([
+            dpsi_dsigma_tens[0, 0], dpsi_dsigma_tens[1, 1], dpsi_dsigma_tens[2, 2],
+            2.0 * dpsi_dsigma_tens[0, 1], 2.0 * dpsi_dsigma_tens[1, 2], 2.0 * dpsi_dsigma_tens[0, 2]
+        ])
+        return q, r
+
     def get_tangent_matrix(self):
         return self.D_e
 
@@ -814,45 +869,29 @@ class CriticalPlanePlasticity3D(ConstitutiveModel):
         return self.stress
 
     def update_state(self, current_strain):
-        """Вызывается на каждой итерации. Считает всё от _old состояния."""
-        # 1. Считаем приращение деформации от начала текущего шага нагрузки
         d_strain = current_strain - self.strain_old
-
-        # 2. Пробное напряжение (отталкиваемся от прошлого сошедшегося)
         stress_trial = self.stress_old + self.D_e @ d_strain
 
-        tensor_3x3 = self._voigt_to_tensor(stress_trial)
-        st_obj = StressTensor.from_matrix(tensor_3x3)
-
-        # 3. Ищем плоскость (только если не треснули на ПРОШЛЫХ шагах)
         if not self.is_cracked_old:
-            _, best_n, _ = cr.find_critical_plane_shear(st_obj, self.material.crit_mat, mode='3D')
+            st_obj_trial = StressTensor.from_matrix(self._voigt_to_tensor(stress_trial))
+            _, best_n, _ = cr.find_critical_plane_shear(st_obj_trial, self.material.crit_mat, mode='3D')
         else:
             best_n = self.fixed_normal_old
 
-        # 4. Проверка критерия
-        sigma_n = st_obj.normal_stress(best_n)
-        tau_n = st_obj.shear_stress_magnitude(best_n)
+        sigma_n_trial, tau_n_trial, s_geom_trial = self._get_stress_on_plane(stress_trial, best_n)
 
-        if tau_n > 1e-12:
-            s_geom = st_obj.shear_stress_vector(best_n) / tau_n
+        # Вычисляем начальную прочность
+        if self.hardening_type == 'friction':
+            mu_trial, _ = self._get_friction_and_hardening(self.kappa_old)
+            c_trial = self.c_fixed
         else:
-            s_geom = np.cross(best_n, np.array([0, 0, 1])) if abs(best_n[2]) < 0.9 else np.cross(best_n,
-                                                                                                 np.array([1, 0, 0]))
-            s_geom = s_geom / np.linalg.norm(s_geom)
+            mu_trial = self.mu_fixed
+            c_trial, _ = self._get_cohesion_and_hardening(self.kappa_old)
 
-        C_val = self.material.crit_mat.get_cohesion(best_n, s_geom)
-        C_threshold = 0.8 * C_val
+        f_yield_trial = tau_n_trial + mu_trial * sigma_n_trial - c_trial
 
-        if sigma_n > 0:
-            resistance = C_threshold + self.material.crit_mat.mu_tensile * sigma_n
-        else:
-            resistance = C_threshold + self.material.crit_mat.mu * sigma_n
-
-        f_yield = tau_n - resistance
-
-        # 5. Упругое поведение
-        if f_yield <= 1e-5:
+        # Упругий шаг
+        if f_yield_trial <= 1e-6:
             self.stress = stress_trial
             self.strain = current_strain
             self.kappa = self.kappa_old
@@ -860,30 +899,89 @@ class CriticalPlanePlasticity3D(ConstitutiveModel):
             self.fixed_normal = self.fixed_normal_old
             return self.stress, self.D_e
 
-        # 6. Пластическое поведение
-        if not self.is_cracked_old:
-            self.is_cracked = True
-            self.fixed_normal = best_n.copy()
+        # --- ПЛАСТИЧЕСКИЙ ШАГ (Cutting Plane Algorithm) ---
+        self.is_cracked = True
+        self.fixed_normal = best_n.copy() if not self.is_cracked_old else self.fixed_normal_old
+
+        stress_k = stress_trial.copy()
+        kappa_k = self.kappa_old
+        delta_gamma = 0.0
+
+        max_iters = 40
+        tol = 1e-5 * self.material.E
+
+        for it in range(max_iters):
+            sigma_n_k, tau_n_k, s_geom_k = self._get_stress_on_plane(stress_k, self.fixed_normal)
+
+            if self.hardening_type == 'friction':
+                mu_k, dmu_dkappa = self._get_friction_and_hardening(kappa_k)
+                c_k = self.c_fixed
+                H = - (dmu_dkappa * sigma_n_k)
+            else:
+                mu_k = self.mu_fixed
+                c_k, dc_dkappa = self._get_cohesion_and_hardening(kappa_k)
+                H = dc_dkappa
+
+            f_k = tau_n_k + mu_k * sigma_n_k - c_k
+
+            # Критерий сходимости
+            if abs(f_k) < tol:
+                break
+
+            q, r = self._get_gradients_voigt(self.fixed_normal, s_geom_k, mu_k, sigma_n_k, tau_n_k)
+
+            denom = np.dot(q, self.D_e @ r) + H
+            if denom <= 1e-10:
+                denom = 1e-10
+
+            d_gamma = f_k / denom
+
+            # ЗАЩИТА 2: Демпфирование (Ограничение максимального скачка за 1 итерацию)
+            max_step = 0.01
+            if d_gamma > max_step:
+                d_gamma = max_step
+            elif d_gamma < -max_step:
+                d_gamma = -max_step
+
+            delta_gamma += d_gamma
+
+            # ЗАЩИТА 3: Пластическая деформация НЕ МОЖЕТ быть отрицательной!
+            if delta_gamma < 0.0:
+                delta_gamma = 0.0
+
+            kappa_k = self.kappa_old + delta_gamma
+
+            # Инкрементальное обновление напряжений (Стягиваем их к поверхности)
+            stress_k -= d_gamma * (self.D_e @ r)
+
+        # Вычисление финальной касательной матрицы по сошедшемуся состоянию
+        sigma_n_k, tau_n_k, s_geom_k = self._get_stress_on_plane(stress_k, self.fixed_normal)
+        if self.hardening_type == 'friction':
+            mu_k, dmu_dkappa = self._get_friction_and_hardening(kappa_k)
+            H = - (dmu_dkappa * sigma_n_k)
         else:
-            self.is_cracked = True
-            self.fixed_normal = self.fixed_normal_old
+            mu_k = self.mu_fixed
+            _, dc_dkappa = self._get_cohesion_and_hardening(kappa_k)
+            H = dc_dkappa
 
-        self.plane_model.kappa = self.kappa_old
-        self.plane_model.c_0 = C_threshold
+        q, r = self._get_gradients_voigt(self.fixed_normal, s_geom_k, mu_k, sigma_n_k, tau_n_k)
 
-        D_ep = self.plane_model.get_tangent_stiffness_matrix(tensor_3x3, self.fixed_normal, self.D_e)
+        D_e_r = self.D_e @ r
+        q_T_D_e = q.T @ self.D_e
+        denom_final = np.dot(q, D_e_r) + H
+        if denom_final <= 1e-10: denom_final = 1e-10
 
-        d_stress_real = D_ep @ d_strain
-        self.stress = self.stress_old + d_stress_real
+        D_ep = self.D_e - np.outer(D_e_r, q_T_D_e) / denom_final
+        # Принудительная симметризация (спасает глобальный решатель)
+        D_ep = 0.5 * (D_ep + D_ep.T)
+
+        self.stress = stress_k
         self.strain = current_strain
-
-        d_strain_plastic = d_strain - np.linalg.solve(self.D_e, d_stress_real)
-        self.kappa = self.kappa_old + np.linalg.norm(d_strain_plastic)
+        self.kappa = kappa_k
 
         return self.stress, D_ep
 
     def commit(self):
-        """Вызывается решателем ТОЛЬКО когда итерации сошлись!"""
         self.stress_old = self.stress.copy()
         self.strain_old = self.strain.copy()
         self.kappa_old = self.kappa
@@ -1492,7 +1590,12 @@ from FEM.Abstract.Structure_Level import Control
 
 
 class NonLinearNewtonRaphsonControl(Control):
-    def __init__(self, model, num_steps=10, tol=1e-4, max_iter=20):
+    """
+    Нелинейный решатель методом Ньютона-Рафсона (Newton-Raphson).
+    Поддерживает как силовое, так и кинематическое (заданные перемещения) нагружение.
+    """
+
+    def __init__(self, model, num_steps=10, tol=1e-4, max_iter=50):
         super().__init__(model)
         self.num_steps = num_steps
         self.tol = tol
@@ -1503,8 +1606,11 @@ class NonLinearNewtonRaphsonControl(Control):
         self.model.initialize()
 
         total_dofs = self.model.total_dofs
+
+        # Глобальный вектор полных перемещений
         U_global = np.zeros(total_dofs)
 
+        # Собираем базовый вектор внешних сил
         F_ext_ref = np.zeros(total_dofs)
         for load in self.model.nodal_loads:
             F_ext_ref[load.node.dofs[load.dof_axis]] += load.value
@@ -1518,6 +1624,7 @@ class NonLinearNewtonRaphsonControl(Control):
             print(f"\n--- Шаг нагрузки {step}/{self.num_steps} (Load Factor = {load_factor:.2f}) ---")
 
             for iteration in range(self.max_iter):
+                # 1. Сборка глобальной касательной матрицы жесткости и вектора внутренних сил
                 K_t = np.zeros((total_dofs, total_dofs))
                 F_int = np.zeros(total_dofs)
 
@@ -1525,74 +1632,124 @@ class NonLinearNewtonRaphsonControl(Control):
                     el_dofs = []
                     for node in element.nodes:
                         el_dofs.extend(node.dofs)
+
+                    # Извлекаем текущие полные перемещения узлов элемента
                     U_el = U_global[el_dofs]
 
+                    # Вычисляем матрицу и внутренние силы элемента
                     K_e, F_int_e = self._compute_element_nonlinear(element, U_el)
 
+                    # Ассемблирование
                     K_t[np.ix_(el_dofs, el_dofs)] += K_e
                     F_int[el_dofs] += F_int_e
 
+                # 2. Вычисление вектора невязки (Residual)
                 Residual = F_ext_current - F_int
 
+                # 3. Применение граничных условий
+                free_dofs = np.ones(total_dofs, dtype=bool)
+
+                # Сначала корректируем правую часть для свободных узлов
                 for bc in self.model.bcs:
                     dof = bc.node.dofs[bc.dof_axis]
-                    val = bc.value * load_factor if iteration == 0 else 0.0
+                    free_dofs[dof] = False  # Отмечаем, что этот DOF закреплен
+
+                    # Приращение заданного перемещения применяется ТОЛЬКО на 0-й итерации шага
+                    delta_u = (bc.value / self.num_steps) if iteration == 0 else 0.0
+
+                    if delta_u != 0.0:
+                        # Переносим влияние заданного перемещения на остальные узлы
+                        Residual -= K_t[:, dof] * delta_u
+
+                # Затем модифицируем матрицу и невязку для закрепленных узлов
+                for bc in self.model.bcs:
+                    dof = bc.node.dofs[bc.dof_axis]
+                    delta_u = (bc.value / self.num_steps) if iteration == 0 else 0.0
 
                     K_t[dof, :] = 0.0
                     K_t[:, dof] = 0.0
                     K_t[dof, dof] = 1.0
-                    Residual[dof] = val
+                    Residual[dof] = delta_u
 
-                free_dofs = [i for i in range(total_dofs) if K_t[i, i] != 1.0 or Residual[i] != 0.0]
-                error = np.linalg.norm(Residual[free_dofs]) if len(free_dofs) > 0 else 0.0
+                # 4. Проверка сходимости (ТОЛЬКО по свободным степеням свободы)
+                free_dofs_indices = np.where(free_dofs)[0]
+                if len(free_dofs_indices) > 0:
+                    error = np.linalg.norm(Residual[free_dofs_indices])
+                    # Нормируем ошибку относительно текущей внешней нагрузки (если она есть)
+                    f_ext_norm = np.linalg.norm(F_ext_current[free_dofs_indices])
+                    if f_ext_norm > 1e-6:
+                        error_rel = error / f_ext_norm
+                    else:
+                        error_rel = error
+                else:
+                    error_rel = 0.0
+                    error = 0.0
 
-                print(f"  Итерация {iteration}: Ошибка = {error:.6e}")
+                print(f"  Итерация {iteration}: Невязка = {error:.6e} (Отн. = {error_rel:.6e})")
 
                 if np.isnan(error) or np.isinf(error):
-                    print("КРИТИЧЕСКАЯ ОШИБКА: Решение разошлось (NaN/Inf).")
+                    print("КРИТИЧЕСКАЯ ОШИБКА: Решение разошлость (NaN/Inf). Матрица стала сингулярной.")
                     return
 
-                if error < self.tol and iteration > 0:
-                    print("  Сходимость достигнута!")
+                # Критерий выхода (сходимость)
+                if error_rel < self.tol and error < self.tol and iteration > 0:
+                    print(f"  Сходимость достигнута за {iteration} итераций!")
                     self._commit_state()
                     break
 
-                dU = np.linalg.solve(K_t, Residual)
+                # 5. Решение системы уравнений K_t * dU = Residual
+                try:
+                    dU = np.linalg.solve(K_t, Residual)
+                except np.linalg.LinAlgError:
+                    print("ОШИБКА: Матрица жесткости вырождена (Singular matrix).")
+                    return
+
+                # 6. Обновление вектора перемещений
                 U_global += dU
 
             else:
-                print("ВНИМАНИЕ: Сходимость не достигнута за максимальное число итераций! Сохраняем как есть.")
+                print("ВНИМАНИЕ: Сходимость не достигнута за максимальное число итераций!")
+                # Даже если не сошлись, фиксируем состояние, чтобы попытаться пройти дальше
                 self._commit_state()
 
+        # Запись финальных перемещений обратно в узлы модели
         for node in self.model.nodes:
             node.displacements = U_global[node.dofs]
-        print("\nРасчет успешно завершен!")
+
+        print("\nРасчет завершен!")
 
     def _commit_state(self):
-        """Фиксирует историю деформаций во всех точках Гаусса"""
+        """Фиксирует историю деформаций во всех точках Гаусса после успешного шага"""
         for element in self.model.elements:
             for ip in element.integration_points:
                 if hasattr(ip.constitutive_model, 'commit'):
                     ip.constitutive_model.commit()
 
     def _compute_element_nonlinear(self, element, U_el):
+        """Вычисляет матрицу жесткости и вектор внутренних сил для одного элемента"""
         ndof = len(U_el)
         K_e = np.zeros((ndof, ndof))
         F_int_e = np.zeros(ndof)
+
         node_coords = np.array([node.coords for node in element.nodes])
 
         for ip in element.integration_points:
+            # Геометрия
             _, detJ = element.shape.get_jacobian(ip.coords, node_coords)
             dN_dx = element.shape.get_shape_derivatives_cartesian(ip.coords, node_coords)
+
+            # Кинематика
             B = element.analysis_model.get_B_matrix(dN_dx)
             h = element.analysis_model.get_h_coefficient()
             dV = detJ * h * ip.weight
 
-            # Передаем ПОЛНУЮ текущую деформацию узлов.
-            # Модель сама найдет разницу с сохраненным шагом.
+            # Вычисление полной деформации в точке Гаусса
             current_strain = B @ U_el
+
+            # Запрос напряжений и касательной матрицы у модели материала
             stress, D_ep = ip.constitutive_model.update_state(current_strain)
 
+            # Численное интегрирование
             K_e += B.T @ D_ep @ B * dV
             F_int_e += B.T @ stress * dV
 
@@ -1686,84 +1843,293 @@ class VTKExporter:
 
 
 ====================
-File: .\Tests\1.py
+File: .\Tests\4_debug_single_element.py
 ====================
 
+# ====================================
+# File: .\Tests\4_debug_single_element.py
+# ====================================
 import numpy as np
-import FEM.Integration_Point_Level.CriticalPlane.material as mt
+import matplotlib.pyplot as plt
 
-from FEM.Abstract.Structure_Level import Node, FEModel
-from FEM.Abstract.Integration_Point_Level import Material
+from FEM.Abstract.Structure_Level import Node, FEModel, Control
+from FEM.Abstract.Integration_Point_Level import Material, ConstitutiveModel
 from FEM.Element_Level.Shape8NodeHexahedron import HEX8Factory
-from FEM.Integration_Point_Level.CriticalPlane.CriticalPlanePlasticity3D import CriticalPlanePlasticity3D
-from FEM.Structure_Level.NonLinearNewtonRaphsonControl import NonLinearNewtonRaphsonControl
-from FEM.Structure_Level.VTKExporter import VTKExporter
 
 
+# ==========================================
+# 1. Глобальный материал
+# ==========================================
 class GlobalMaterial(Material):
-    def __init__(self, E, nu, crit_mat):
+    def __init__(self, E, nu, crit_mat=None):
         super().__init__(E, nu)
         self.crit_mat = crit_mat
 
 
-def run_nonlinear_fem():
-    print("=== Нелинейный расчет (Единицы: Метры, Меганьютоны, Мегапаскали) ===")
-
-    nodes = [
-        Node(0, [0.0, 0.0, 0.0]), Node(1, [1.0, 0.0, 0.0]), Node(2, [1.0, 1.0, 0.0]), Node(3, [0.0, 1.0, 0.0]),
-        Node(4, [0.0, 0.0, 1.0]), Node(5, [1.0, 0.0, 1.0]), Node(6, [1.0, 1.0, 1.0]), Node(7, [0.0, 1.0, 1.0]),
-        Node(8, [2.0, 0.0, 0.0]), Node(9, [2.0, 1.0, 0.0]), Node(10, [2.0, 0.0, 1.0]), Node(11, [2.0, 1.0, 1.0])
-    ]
-
-    tensor_data = """
-    0.900000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
-    0.000000 0.399714 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
-    0.000000 0.000000 0.900000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
-    0.000000 0.000000 0.000000 0.399994 0.000000 0.000000 0.000000 0.000000 0.000000
-    0.000000 0.000000 0.000000 0.000000 0.396589 0.000000 0.000000 0.000000 0.000000
-    0.000000 0.000000 0.000000 0.000000 0.000000 0.396613 0.000000 0.000000 0.000000
-    0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.544270 0.000000 0.000000
-    0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.400018 0.000000
-    0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.900000
+# ==========================================
+# 2. МАКСИМАЛЬНО ПРОСТАЯ МОДЕЛЬ МАТЕРИАЛА (J2 von Mises)
+# ==========================================
+class SimpleTestPlasticity3D(ConstitutiveModel):
+    """
+    Максимально простая билинейная модель (J2 von Mises).
+    Служит ТОЛЬКО для проверки корректности глобальной системы (сборка, ГУ, решатель).
+    Возвращает упругую касательную матрицу (Modified Newton-Raphson) для 100% стабильности.
     """
 
-    # C_val из A_matrix получается около 1.0 (что означает 1.0 МПа)
-    A_matrix = mt.load_tensor_from_string(tensor_data)
-    crit_mat = mt.Material(mu=-0.7, A_tensor=A_matrix)
+    def __init__(self, material):
+        super().__init__(material)
+        E = self.material.E
+        nu = self.material.nu
 
-    # E = 20 ГПа = 20000 МПа
-    material = GlobalMaterial(E=20000.0, nu=0.2, crit_mat=crit_mat)
+        self.yield_stress = 10.0  # Предел текучести (МПа)
+        self.H = 1000.0  # Модуль изотропного упрочнения (МПа)
+
+        # Упругая матрица 6x6
+        C = E / ((1 + nu) * (1 - 2 * nu))
+        self.D_e = np.zeros((6, 6))
+        self.D_e[0:3, 0:3] = C * nu
+        self.D_e[0, 0] = self.D_e[1, 1] = self.D_e[2, 2] = C * (1 - nu)
+        self.G = E / (2 * (1 + nu))
+        self.D_e[3, 3] = self.D_e[4, 4] = self.D_e[5, 5] = self.G
+
+        self.stress_old = np.zeros(6)
+        self.strain_old = np.zeros(6)
+        self.ep_eq_old = 0.0  # Накопленная пластическая деформация
+
+        self.stress = np.zeros(6)
+        self.strain = np.zeros(6)
+        self.ep_eq = 0.0
+
+    # Обязательные методы от базового класса
+    def get_tangent_matrix(self):
+        return self.D_e
+
+    def get_stress(self, strain):
+        return self.stress
+
+    def update_state(self, current_strain):
+        self.strain = current_strain
+        d_strain = current_strain - self.strain_old
+
+        # 1. Упругий шаг (Trial state)
+        stress_trial = self.stress_old + self.D_e @ d_strain
+
+        # 2. Интенсивность напряжений Мизеса (q)
+        p_trial = np.sum(stress_trial[0:3]) / 3.0
+        s_trial = stress_trial.copy()
+        s_trial[0:3] -= p_trial
+
+        J2 = 0.5 * (s_trial[0] ** 2 + s_trial[1] ** 2 + s_trial[2] ** 2) + \
+             (s_trial[3] ** 2 + s_trial[4] ** 2 + s_trial[5] ** 2)
+        q_trial = np.sqrt(3.0 * J2) if J2 > 0 else 0.0
+
+        # 3. Критерий текучести
+        current_yield = self.yield_stress + self.H * self.ep_eq_old
+        f_yield = q_trial - current_yield
+
+        if f_yield <= 1e-6:
+            # Упругое состояние
+            self.stress = stress_trial
+            self.ep_eq = self.ep_eq_old
+            return self.stress, self.D_e
+
+        # 4. Пластическое состояние (Radial Return)
+        d_gamma = f_yield / (3 * self.G + self.H)
+        self.ep_eq = self.ep_eq_old + d_gamma
+
+        factor = 1.0 - (3 * self.G * d_gamma) / q_trial
+        s_new = s_trial * factor
+
+        self.stress = s_new
+        self.stress[0:3] += p_trial
+
+        # Для проверки системы возвращаем упругую матрицу (метод начальной жесткости).
+        return self.stress, self.D_e
+
+    def commit(self):
+        self.stress_old = self.stress.copy()
+        self.strain_old = self.strain.copy()
+        self.ep_eq_old = self.ep_eq
+
+
+# ==========================================
+# 3. ОТЛАДОЧНЫЙ РЕШАТЕЛЬ (С правильным учетом ГУ)
+# ==========================================
+class DebugNewtonRaphsonControl(Control):
+    def __init__(self, model, track_nodes, num_steps=20, tol=1e-4, max_iter=50):
+        super().__init__(model)
+        self.num_steps = num_steps
+        self.tol = tol
+        self.max_iter = max_iter
+        self.track_nodes = track_nodes
+        self.history_Uz = [0.0]
+        self.history_Fz = [0.0]
+
+    def solve(self):
+        print("Инициализация модели...")
+        self.model.initialize()
+        total_dofs = self.model.total_dofs
+        U_global = np.zeros(total_dofs)
+
+        for step in range(1, self.num_steps + 1):
+            print(f"\n=== Шаг {step}/{self.num_steps} ===")
+
+            for iteration in range(self.max_iter):
+                K_t = np.zeros((total_dofs, total_dofs))
+                F_int = np.zeros(total_dofs)
+
+                for element in self.model.elements:
+                    el_dofs = []
+                    for node in element.nodes: el_dofs.extend(node.dofs)
+                    U_el = U_global[el_dofs]
+                    K_e, F_int_e = self._compute_element_nonlinear(element, U_el)
+                    K_t[np.ix_(el_dofs, el_dofs)] += K_e
+                    F_int[el_dofs] += F_int_e
+
+                Residual = -F_int
+
+                # ПРИМЕНЕНИЕ ГУ
+                free_dofs = np.ones(total_dofs, dtype=bool)
+
+                # 1. Корректировка Residual для свободных узлов
+                for bc in self.model.bcs:
+                    dof = bc.node.dofs[bc.dof_axis]
+                    free_dofs[dof] = False
+                    delta_u = (bc.value / self.num_steps) if iteration == 0 else 0.0
+                    if delta_u != 0.0:
+                        Residual -= K_t[:, dof] * delta_u
+
+                # 2. Модификация матрицы
+                for bc in self.model.bcs:
+                    dof = bc.node.dofs[bc.dof_axis]
+                    delta_u = (bc.value / self.num_steps) if iteration == 0 else 0.0
+                    K_t[dof, :] = 0.0
+                    K_t[:, dof] = 0.0
+                    K_t[dof, dof] = 1.0
+                    Residual[dof] = delta_u
+
+                # Ошибка только по свободным узлам
+                free_dofs_indices = np.where(free_dofs)[0]
+                error = np.linalg.norm(Residual[free_dofs_indices]) if len(free_dofs_indices) > 0 else 0.0
+
+                print(f"  Итер {iteration}: Невязка = {error:.6e}")
+
+                if np.isnan(error) or np.isinf(error):
+                    print("!!! КРИТИЧЕСКАЯ ОШИБКА: NaN/Inf. Решение разошлось !!!")
+                    return
+
+                if error < self.tol and iteration > 0:
+                    print("  -> Сходимость достигнута.")
+                    self._commit_state()
+
+                    # Сбор реакций
+                    rz_force = sum(F_int[n.dofs[2]] for n in self.track_nodes)
+                    self.history_Uz.append(U_global[self.track_nodes[0].dofs[2]])
+                    self.history_Fz.append(rz_force)
+                    break
+
+                dU = np.linalg.solve(K_t, Residual)
+                U_global += dU
+            else:
+                print("!!! ВНИМАНИЕ: Сходимость не достигнута за макс. число итераций !!!")
+                self._commit_state()
+                rz_force = sum(F_int[n.dofs[2]] for n in self.track_nodes)
+                self.history_Uz.append(U_global[self.track_nodes[0].dofs[2]])
+                self.history_Fz.append(rz_force)
+
+        for node in self.model.nodes:
+            node.displacements = U_global[node.dofs]
+
+    def _commit_state(self):
+        for element in self.model.elements:
+            for ip in element.integration_points:
+                if hasattr(ip.constitutive_model, 'commit'): ip.constitutive_model.commit()
+
+    def _compute_element_nonlinear(self, element, U_el):
+        ndof = len(U_el)
+        K_e = np.zeros((ndof, ndof))
+        F_int_e = np.zeros(ndof)
+        node_coords = np.array([node.coords for node in element.nodes])
+
+        for ip in element.integration_points:
+            _, detJ = element.shape.get_jacobian(ip.coords, node_coords)
+            dN_dx = element.shape.get_shape_derivatives_cartesian(ip.coords, node_coords)
+            B = element.analysis_model.get_B_matrix(dN_dx)
+            h = element.analysis_model.get_h_coefficient()
+            dV = detJ * h * ip.weight
+
+            current_strain = B @ U_el
+            stress, D_ep = ip.constitutive_model.update_state(current_strain)
+
+            K_e += B.T @ D_ep @ B * dV
+            F_int_e += B.T @ stress * dV
+
+        return K_e, F_int_e
+
+
+# ==========================================
+# 4. ОСНОВНОЙ ТЕСТ (1 Элемент)
+# ==========================================
+def run_single_element_debug():
+    print("=== ЗАПУСК ОТЛАДОЧНОГО ТЕСТА (1 ЭЛЕМЕНТ - ПРОСТАЯ ПЛАСТИЧНОСТЬ) ===")
+
+    # 1. Материал
+    material = GlobalMaterial(E=20000.0, nu=0.2, crit_mat=None)
     factory = HEX8Factory()
 
-    el1 = factory.create_element(nodes[0:8], material, constitutive_class=CriticalPlanePlasticity3D)
-    el2_nodes = [nodes[1], nodes[8], nodes[9], nodes[2], nodes[5], nodes[10], nodes[11], nodes[6]]
-    el2 = factory.create_element(el2_nodes, material, constitutive_class=CriticalPlanePlasticity3D)
-
+    # 2. Сетка: 1 кубик 1x1x1
+    nodes = [
+        Node(0, [0, 0, 0]), Node(1, [1, 0, 0]), Node(2, [1, 1, 0]), Node(3, [0, 1, 0]),
+        Node(4, [0, 0, 1]), Node(5, [1, 0, 1]), Node(6, [1, 1, 1]), Node(7, [0, 1, 1])
+    ]
     model = FEModel()
     model.nodes = nodes
-    model.elements = [el1, el2]
     model.materials = [material]
 
-    for node in [nodes[0], nodes[3], nodes[4], nodes[7]]:
-        model.add_bc(node, 0, 0.0)
-        model.add_bc(node, 1, 0.0)
-        model.add_bc(node, 2, 0.0)
+    # Создаем элемент с ПРОСТОЙ моделью пластичности
+    el = factory.create_element(nodes, material, constitutive_class=SimpleTestPlasticity3D)
+    model.elements.append(el)
 
-    # Сила 100 кН = 0.1 МН. Делим на 4 узла = 0.025 МН на узел.
-    for node in [nodes[8], nodes[9], nodes[10], nodes[11]]:
-        model.add_load(node, 2, -0.025)
+    # 3. Граничные условия (Идеальное одноосное сжатие)
+    # Запрещаем движение нижней грани по Z
+    for i in [0, 1, 2, 3]: model.add_bc(nodes[i], 2, 0.0)
 
-    # Запуск
-    control = NonLinearNewtonRaphsonControl(model, num_steps=10, tol=1e-4)
+    # Симметрия для предотвращения жесткого смещения (Roller supports)
+    model.add_bc(nodes[0], 0, 0.0)
+    model.add_bc(nodes[3], 0, 0.0)
+    model.add_bc(nodes[4], 0, 0.0)
+    model.add_bc(nodes[7], 0, 0.0)
+
+    model.add_bc(nodes[0], 1, 0.0)
+    model.add_bc(nodes[1], 1, 0.0)
+    model.add_bc(nodes[4], 1, 0.0)
+    model.add_bc(nodes[5], 1, 0.0)
+
+    # Задаем перемещение верхней грани по Z
+    top_nodes = [nodes[4], nodes[5], nodes[6], nodes[7]]
+    target_disp_z = -0.005  # -5 мм (даст деформацию -0.005)
+    for n in top_nodes: model.add_bc(n, 2, target_disp_z)
+
+    # 4. Решение
+    # 20 шагов дадут красивую кривую. max_iter=50 т.к. мы используем упругую касательную D_e
+    control = DebugNewtonRaphsonControl(model=model, track_nodes=top_nodes, num_steps=20, tol=1e-4, max_iter=50)
     control.solve()
 
-    print("\nПеремещения на свободном конце (X=2.0) после нелинейного расчета:")
-    for node in [nodes[8], nodes[9], nodes[10], nodes[11]]:
-        print(f"Узел {node.id}: dZ = {node.displacements[2]:.5e} м")
+    # 5. Построение графика
+    displacements_z = [abs(u) * 1000 for u in control.history_Uz]
+    forces_z = [abs(f) for f in control.history_Fz]
 
-    VTKExporter.export(model, "nonlinear_beam_results.vtk")
+    plt.figure(figsize=(8, 6))
+    plt.plot(displacements_z, forces_z, marker='o', color='r', linewidth=2)
+    plt.title("Отладочный тест: 1 Элемент (Модель Мизеса)")
+    plt.xlabel("Осадка |Uz| (мм)")
+    plt.ylabel("Сила реакции Fz (МН)")
+    plt.grid(True, linestyle='--')
+    plt.tight_layout()
+    plt.savefig("debug_1_element_mises.png", dpi=300)
+    plt.show()
 
 
 if __name__ == "__main__":
-    run_nonlinear_fem()
+    run_single_element_debug()
 
