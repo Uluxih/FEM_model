@@ -1,6 +1,3 @@
-# ====================================
-# File: .\FEM\Structure_Level\VTKExporter.py
-# ====================================
 import os
 
 
@@ -19,7 +16,6 @@ class VTKExporter:
             return
 
         # Создаем словарь для маппинга ID узлов в последовательные индексы (0, 1, 2...)
-        # VTK требует строгую нумерацию с нуля.
         node_to_index = {node.id: idx for idx, node in enumerate(model.nodes)}
 
         with open(filename, "w", encoding="utf-8") as f:
@@ -33,21 +29,16 @@ class VTKExporter:
             f.write(f"POINTS {num_nodes} float\n")
             for node in model.nodes:
                 coords = node.coords
-                # VTK всегда ожидает 3 координаты (X, Y, Z)
                 x = coords[0] if len(coords) > 0 else 0.0
                 y = coords[1] if len(coords) > 1 else 0.0
                 z = coords[2] if len(coords) > 2 else 0.0
                 f.write(f"{x:.6f} {y:.6f} {z:.6f}\n")
 
             # 3. Запись топологии элементов (CELLS)
-            # Формат: <кол-во узлов в элементе> <индекс_узла_1> ... <индекс_узла_N>
-            # Считаем общий размер списка ячеек: (кол-во узлов + 1) для каждого элемента
             total_list_size = sum(len(el.nodes) + 1 for el in model.elements)
             f.write(f"\nCELLS {num_elements} {total_list_size}\n")
-
             for el in model.elements:
                 n_nodes = len(el.nodes)
-                # Получаем последовательные индексы узлов
                 indices = [str(node_to_index[node.id]) for node in el.nodes]
                 f.write(f"{n_nodes} " + " ".join(indices) + "\n")
 
@@ -55,20 +46,16 @@ class VTKExporter:
             f.write(f"\nCELL_TYPES {num_elements}\n")
             for el in model.elements:
                 n_nodes = len(el.nodes)
-                # 12 = VTK_HEXAHEDRON (8 узлов)
-                # 9  = VTK_QUAD (4 узла)
                 if n_nodes == 8:
                     vtk_type = 12
                 elif n_nodes == 4:
                     vtk_type = 9
                 else:
-                    vtk_type = 1  # Неизвестный тип (Vertex)
+                    vtk_type = 1
                 f.write(f"{vtk_type}\n")
 
             # 5. Запись узловых результатов (POINT_DATA)
             f.write(f"\nPOINT_DATA {num_nodes}\n")
-
-            # Векторное поле: Перемещения
             f.write("VECTORS Displacements float\n")
             for node in model.nodes:
                 disp = node.displacements
@@ -84,12 +71,12 @@ class VTKExporter:
             f.write("VECTORS JointNormal float\n")
             for el in model.elements:
                 nx, ny, nz = 0.0, 0.0, 0.0
-                # Пытаемся извлечь нормаль из первой точки интегрирования элемента
                 if len(el.integration_points) > 0:
                     c_model = el.integration_points[0].constitutive_model
-                    # Проверяем, есть ли у модели материал и есть ли у материала нормаль
-                    if hasattr(c_model, 'mat') and hasattr(c_model.mat, 'normal'):
-                        nx, ny, nz = c_model.mat.normal
+                    # ИСПРАВЛЕНИЕ: Читаем нормаль из зафиксированного состояния модели
+                    if hasattr(c_model, 'is_locked') and c_model.is_locked:
+                        if c_model.fixed_normal is not None:
+                            nx, ny, nz = c_model.fixed_normal
                 f.write(f"{nx:.6f} {ny:.6f} {nz:.6f}\n")
 
         print("Готово!")

@@ -1,13 +1,20 @@
 import numpy as np
+
+# Импортируем модули для поиска критической плоскости
+from FEM.Integration_Point_Level.CriticalPlane.criterion import (
+    find_critical_plane_shear,
+    find_critical_plane_tensile
+)
+from FEM.Integration_Point_Level.CriticalPlane.tensor import StressTensor
 from FEM.Abstract.Integration_Point_Level import ConstitutiveModel
 
 
 class UbiquitousJointModel3D(ConstitutiveModel):
     """
-    Строгая модель эквивалентной сплошной среды (Последовательное соединение).
-    Реализует C_eq = C_rock + C_joint с точным тензорным вращением
-    и ТОЧНЫМ алгоритмическим согласованным тензором жесткости (Consistent Tangent Operator)
-    для обеспечения квадратичной сходимости метода Ньютона-Рафсона.
+    Адаптивная модель сплошной среды с фиксацией трещины (Fixed Smeared Crack).
+    - До разрушения: Изотропная упругая порода.
+    - При разрушении: Ищет критическую плоскость и фиксирует её.
+    - После разрушения: Строгая модель Ubiquitous Joint с согласованной матрицей.
     """
 
     def __init__(self, material):
@@ -15,51 +22,47 @@ class UbiquitousJointModel3D(ConstitutiveModel):
 
         E = self.material.E
         nu = self.material.nu
-        joint_params = self.material.joint_params
+        jp = self.material.joint_params
 
-        # 1. Параметры трещины
-        self.kn = joint_params['kn']
-        self.ks = joint_params['ks']
-        self.kt = joint_params['kt']
-        self.S = joint_params['spacing']
-
-        self.c = joint_params.get('c', 0.0)
-        self.phi = np.radians(joint_params.get('phi', 0.0))
-        self.psi = np.radians(joint_params.get('psi', 0.0))
-        self.t_limit = joint_params.get('t', 0.0)
+        # --- 1. Параметры трещины (включаются ПОСЛЕ фиксации) ---
+        self.kn, self.ks, self.kt, self.S = jp['kn'], jp['ks'], jp['kt'], jp['spacing']
+        self.c = jp.get('c', 0.0)
+        self.phi = np.radians(jp.get('phi', 0.0))
+        self.psi = np.radians(jp.get('psi', 0.0))
+        self.t_limit = jp.get('t', 0.0)
 
         # Ограничение на растяжение (Apex correction)
         if self.phi > 0:
             t_max = self.c / np.tan(self.phi)
             self.t_limit = min(self.t_limit, t_max)
 
-        # 2. Построение матриц в ЛОКАЛЬНЫХ осях трещины (Нормаль = Z')
+        # --- 2. Параметры поиска (Critical Plane Material) ---
+        self.cp_material = jp.get('cp_material', None)
+        if self.cp_material is None:
+            raise ValueError("Для адаптивной модели необходимо передать 'cp_material' в joint_params!")
+
+        # --- 3. Упругая матрица целой породы (действует ДО фиксации) ---
         self.C_rock = self._build_isotropic_compliance(E, nu)
-        self.C_joint_local = self._build_joint_compliance(self.kn, self.ks, self.kt, self.S)
+        self.D_rock = np.linalg.inv(self.C_rock)
 
-        # Строгое последовательное соединение (сумма податливостей)
-        self.C_eq_local = self.C_rock + self.C_joint_local
+        # --- 4. Переменные состояния фиксации ---
+        self.is_locked = False
+        self.fixed_normal = None
 
-        # Эквивалентная упругая жесткость в локальных осях
-        self.D_eq_local = np.linalg.inv(self.C_eq_local)
+        # Заглушки для матриц, которые будут построены при фиксации
+        self.R = np.eye(3)
+        self.D_eq_local = None
+        self.D_eq_global = self.D_rock.copy()
+        self.alpha_1 = 0.0
+        self.alpha_2 = 0.0
 
-        # 3. Извлечение СТРОГИХ модулей для Return Mapping
-        self.alpha_1 = self.D_eq_local[2, 2]  # Реакция нормального напряжения
-        self.alpha_2 = (self.D_eq_local[4, 4] + self.D_eq_local[5, 5]) / 2.0  # Усредненная сдвиговая жесткость
-
-        # 4. Построение матрицы поворота и глобальной матрицы жесткости
-        normal = np.array(joint_params.get('normal', [0.0, 0.0, 1.0]))
-        self.R = self._build_rotation_matrix(normal)
-        self.D_eq_global = self._rotate_stiffness_matrix(self.D_eq_local, self.R)
-
-        # Переменные состояния
+        # Переменные состояния напряжений/деформаций
         self.stress_old = np.zeros(6)
         self.strain_old = np.zeros(6)
         self.stress = np.zeros(6)
         self.strain = np.zeros(6)
 
     def _build_isotropic_compliance(self, E, nu):
-        """Матрица податливости изотропной породы (6x6)"""
         C = np.zeros((6, 6))
         G = E / (2.0 * (1.0 + nu))
         C[0, 0] = C[1, 1] = C[2, 2] = 1.0 / E
@@ -68,155 +71,151 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         return C
 
     def _build_joint_compliance(self, kn, ks, kt, S):
-        """Матрица податливости трещин в локальных осях (6x6)"""
         C = np.zeros((6, 6))
-        C[2, 2] = 1.0 / (kn * S)  # Нормаль к трещине (ось Z')
-        C[4, 4] = 1.0 / (kt * S)  # Сдвиг Y'Z'
-        C[5, 5] = 1.0 / (ks * S)  # Сдвиг X'Z'
+        C[2, 2] = 1.0 / (kn * S)
+        C[4, 4] = 1.0 / (kt * S)
+        C[5, 5] = 1.0 / (ks * S)
         return C
 
-    def _build_rotation_matrix(self, normal):
-        """Тензор поворота R (столбцы - локальные базисные векторы)"""
-        nz = np.array(normal, dtype=float)
-        nz = nz / np.linalg.norm(nz)
-        if abs(nz[2]) > 0.9999:
+    def _build_rotation_matrix(self, n):
+        nz = np.array(n) / np.linalg.norm(n)
+        if abs(nz[2]) > 0.999:
             nx = np.array([1.0, 0.0, 0.0])
-            ny = np.cross(nz, nx)
+            ny = np.cross(nz, nx)  # <--- ИСПРАВЛЕНИЕ ОШИБКИ ЗДЕСЬ
         else:
-            ny = np.cross(nz, np.array([0.0, 0.0, 1.0]))
-            ny = ny / np.linalg.norm(ny)
+            ny = np.cross(nz, [0.0, 0.0, 1.0])
+            ny /= np.linalg.norm(ny)
             nx = np.cross(ny, nz)
-        nx = nx / np.linalg.norm(nx)
+        nx /= np.linalg.norm(nx)
         return np.column_stack((nx, ny, nz))
 
-    def _voigt_to_stress_tensor(self, v):
-        return np.array([[v[0], v[3], v[5]], [v[3], v[1], v[4]], [v[5], v[4], v[2]]])
-
-    def _stress_tensor_to_voigt(self, t):
-        return np.array([t[0, 0], t[1, 1], t[2, 2], t[0, 1], t[1, 2], t[0, 2]])
-
-    def _voigt_to_strain_tensor(self, v):
-        return np.array(
-            [[v[0], v[3] / 2.0, v[5] / 2.0], [v[3] / 2.0, v[1], v[4] / 2.0], [v[5] / 2.0, v[4] / 2.0, v[2]]])
-
-    def _strain_tensor_to_voigt(self, t):
-        return np.array([t[0, 0], t[1, 1], t[2, 2], 2.0 * t[0, 1], 2.0 * t[1, 2], 2.0 * t[0, 2]])
-
-    def _rotate_stiffness_matrix(self, D_local, R):
-        """Строгое вращение матрицы жесткости 6x6 через тензорные преобразования."""
-        D_global = np.zeros((6, 6))
+    def _rotate_matrix(self, D, R):
+        """Вращение матрицы жесткости 6x6"""
+        D_glob = np.zeros((6, 6))
         for j in range(6):
-            eps_voigt_global = np.zeros(6)
-            eps_voigt_global[j] = 1.0
-            eps_tensor_global = self._voigt_to_strain_tensor(eps_voigt_global)
-            eps_tensor_local = R.T @ eps_tensor_global @ R
-            eps_voigt_local = self._strain_tensor_to_voigt(eps_tensor_local)
+            e_g = np.zeros(6);
+            e_g[j] = 1.0
+            et_g = np.array(
+                [[e_g[0], e_g[3] / 2, e_g[5] / 2], [e_g[3] / 2, e_g[1], e_g[4] / 2], [e_g[5] / 2, e_g[4] / 2, e_g[2]]])
+            et_l = R.T @ et_g @ R
+            ev_l = np.array([et_l[0, 0], et_l[1, 1], et_l[2, 2], 2 * et_l[0, 1], 2 * et_l[1, 2], 2 * et_l[0, 2]])
 
-            sig_voigt_local = D_local @ eps_voigt_local
+            sv_l = D @ ev_l
+            st_l = np.array([[sv_l[0], sv_l[3], sv_l[5]], [sv_l[3], sv_l[1], sv_l[4]], [sv_l[5], sv_l[4], sv_l[2]]])
+            st_g = R @ st_l @ R.T
+            D_glob[:, j] = np.array([st_g[0, 0], st_g[1, 1], st_g[2, 2], st_g[0, 1], st_g[1, 2], st_g[0, 2]])
+        return D_glob
 
-            sig_tensor_local = self._voigt_to_stress_tensor(sig_voigt_local)
-            sig_tensor_global = R @ sig_tensor_local @ R.T
-            sig_voigt_global = self._stress_tensor_to_voigt(sig_tensor_global)
+    def _voigt_to_stresstensor(self, v):
+        """Конвертация вектора Фойгта в объект StressTensor"""
+        return StressTensor(v[0], v[1], v[2], v[3], v[4], v[5])
 
-            D_global[:, j] = sig_voigt_global
-        return D_global
+    def _lock_plane(self, normal):
+        """Процедура фиксации трещины и перестроения матриц жесткости"""
+        self.fixed_normal = normal
+        self.R = self._build_rotation_matrix(normal)
 
-    def get_tangent_matrix(self):
-        return self.D_eq_global
+        # Добавляем податливость трещины к породе
+        C_joint_local = self._build_joint_compliance(self.kn, self.ks, self.kt, self.S)
+        C_eq_local = self.C_rock + C_joint_local
+        self.D_eq_local = np.linalg.inv(C_eq_local)
 
-    def get_stress(self, strain):
-        return self.stress
+        # Модули для Return Mapping
+        self.alpha_1 = self.D_eq_local[2, 2]
+        self.alpha_2 = (self.D_eq_local[4, 4] + self.D_eq_local[5, 5]) / 2.0
+
+        # Глобальная эквивалентная матрица с учетом трещины
+        self.D_eq_global = self._rotate_matrix(self.D_eq_local, self.R)
+        self.is_locked = True
+
+        print(f" [!] ОБРАЗОВАНИЕ ТРЕЩИНЫ. Нормаль зафиксирована: [{normal[0]:.3f}, {normal[1]:.3f}, {normal[2]:.3f}]")
 
     def update_state(self, current_strain):
         self.strain = current_strain
         d_strain = current_strain - self.strain_old
 
-        # 1. Упругий предиктор
-        stress_trial_voigt = self.stress_old + self.D_eq_global @ d_strain
-        stress_trial_tensor = self._voigt_to_stress_tensor(stress_trial_voigt)
+        # ==========================================================
+        # ЭТАП 1: ПОИСК И ФИКСАЦИЯ (Если трещина еще не образовалась)
+        # ==========================================================
+        if not self.is_locked:
+            # Считаем пробное напряжение как для целой породы
+            stress_trial_rock = self.stress_old + self.D_rock @ d_strain
+            st = self._voigt_to_stresstensor(stress_trial_rock)
 
-        # 2. Перевод напряжений в локальные оси трещины
-        local_stress = self.R.T @ stress_trial_tensor @ self.R
+            # Ищем критическую плоскость
+            f_sh, n_sh, util_sh = find_critical_plane_shear(st, self.cp_material, mode='3D')
+            f_t, n_t, util_t = find_critical_plane_tensile(st, self.cp_material, mode='3D')
 
-        sig_33 = local_stress[2, 2]
-        sig_13 = local_stress[0, 2]
-        sig_23 = local_stress[1, 2]
-        tau = np.sqrt(sig_13 ** 2 + sig_23 ** 2)
+            max_f = max(f_sh, f_t)
 
-        # 3. Проверка критериев
-        f_s = tau + sig_33 * np.tan(self.phi) - self.c
-        f_t = sig_33 - self.t_limit
+            if max_f > 0:
+                # Порода не выдержала! Фиксируем плоскость.
+                best_n = n_sh if f_sh > f_t else n_t
+                self._lock_plane(best_n)
+            else:
+                # Порода держит нагрузку. Возвращаем упругое состояние.
+                self.stress = stress_trial_rock
+                return self.stress, self.D_rock
+
+        # ==========================================================
+        # ЭТАП 2: РАБОТА С ЗАФИКСИРОВАННОЙ ТРЕЩИНОЙ (Return Mapping)
+        # ==========================================================
+        # Считаем пробное напряжение уже с учетом податливости трещины (D_eq_global)
+        sig_tr_v = self.stress_old + self.D_eq_global @ d_strain
+
+        # Перевод в локальные оси трещины
+        st_t = np.array([[sig_tr_v[0], sig_tr_v[3], sig_tr_v[5]],
+                         [sig_tr_v[3], sig_tr_v[1], sig_tr_v[4]],
+                         [sig_tr_v[5], sig_tr_v[4], sig_tr_v[2]]])
+        sig_tr_l_t = self.R.T @ st_t @ self.R
+
+        s33, s13, s23 = sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2]
+        tau = np.sqrt(s13 ** 2 + s23 ** 2)
+
+        # Проверка критериев (на уже зафиксированной плоскости)
+        f_s = tau + s33 * np.tan(self.phi) - self.c
+        f_t = s33 - self.t_limit
 
         if f_s <= 0 and f_t <= 0:
-            self.stress = stress_trial_voigt
-            # Если упругость — возвращаем начальную эквивалентную матрицу
+            self.stress = sig_tr_v
             return self.stress, self.D_eq_global
 
-        # 4. Пластическая коррекция и расчет Согласованной Матрицы
-        is_tension = f_t > 0
+        # --- АЛГОРИТМИЧЕСКИЙ ВОЗВРАТ И СОГЛАСОВАННАЯ МАТРИЦА ---
+        D_tan_l = self.D_eq_local.copy()
 
-        if f_s > 0 and not is_tension:
-            lam_s = f_s / (self.alpha_2 - self.alpha_1 * np.tan(self.psi) * np.tan(self.phi))
-            sig_33_test = sig_33 + lam_s * self.alpha_1 * np.tan(self.psi)
-            if sig_33_test > self.t_limit:
-                is_tension = True
-
-        # Инициализируем локальную касательную матрицу упругой жесткостью
-        D_tan_local = self.D_eq_local.copy()
-
-        if is_tension:
-            # --- Разрушение при растяжении ---
-            local_stress[2, 2] = self.t_limit
-            local_stress[0, 2] = local_stress[2, 0] = 0.0
-            local_stress[1, 2] = local_stress[2, 1] = 0.0
-
-            # Точная касательная: жесткость по нормали и сдвигам обнуляется
-            D_tan_local[2, :] = 0.0;
-            D_tan_local[:, 2] = 0.0
-            D_tan_local[4, :] = 0.0;
-            D_tan_local[:, 4] = 0.0
-            D_tan_local[5, :] = 0.0;
-            D_tan_local[:, 5] = 0.0
-
+        if f_t > 0 or (f_s > 0 and (s33 + (f_s / self.alpha_2) * self.alpha_1 * np.tan(self.psi)) > self.t_limit):
+            # Отрыв
+            sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2] = self.t_limit, 0, 0
+            D_tan_l[2, :] = 0; D_tan_l[:, 2] = 0
+            D_tan_l[4, :] = 0; D_tan_l[:, 4] = 0
+            D_tan_l[5, :] = 0; D_tan_l[:, 5] = 0
         else:
-            # --- Сдвиговое разрушение ---
-            lam_s = f_s / (self.alpha_2 - self.alpha_1 * np.tan(self.psi) * np.tan(self.phi))
+            # Сдвиг
+            tan_phi, tan_psi = np.tan(self.phi), np.tan(self.psi)
+            lam = f_s / (self.alpha_2 + self.alpha_1 * tan_phi * tan_psi)
 
-            sig_33_new = sig_33 + lam_s * self.alpha_1 * np.tan(self.psi)
-            tau_new = tau - lam_s * self.alpha_2
+            sig_33_new = s33 - lam * self.alpha_1 * tan_psi
+            tau_new = tau - lam * self.alpha_2
 
-            apex_stress = self.c / np.tan(self.phi) if self.phi > 0 else float('inf')
+            apex_stress = self.c / tan_phi if self.phi > 0 else float('inf')
 
             if sig_33_new > apex_stress:
-                # Попадание в вершину конуса (Apex)
-                local_stress[2, 2] = apex_stress
-                local_stress[0, 2] = local_stress[2, 0] = 0.0
-                local_stress[1, 2] = local_stress[2, 1] = 0.0
-
-                # Точная касательная: полная потеря несущей способности на площадке
-                D_tan_local[2, :] = 0.0;
-                D_tan_local[:, 2] = 0.0
-                D_tan_local[4, :] = 0.0;
-                D_tan_local[:, 4] = 0.0
-                D_tan_local[5, :] = 0.0;
-                D_tan_local[:, 5] = 0.0
+                sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2] = apex_stress, 0, 0
+                D_tan_l[2, :] = 0; D_tan_l[:, 2] = 0
+                D_tan_l[4, :] = 0; D_tan_l[:, 4] = 0
+                D_tan_l[5, :] = 0; D_tan_l[:, 5] = 0
             else:
-                # Гладкая часть конуса
-                local_stress[2, 2] = sig_33_new
+                sig_tr_l_t[2, 2] = sig_33_new
                 if tau > 0:
-                    local_stress[0, 2] = local_stress[2, 0] = sig_13 * (tau_new / tau)
-                    local_stress[1, 2] = local_stress[2, 1] = sig_23 * (tau_new / tau)
+                    factor = tau_new / tau
+                    sig_tr_l_t[0, 2] *= factor
+                    sig_tr_l_t[1, 2] *= factor
 
-                # Вычисление континуальной упругопластической матрицы (Continuum Elastoplastic Tangent)
-                n_vec = np.zeros(6)  # Нормаль к поверхности текучести (df/d_sigma)
-                m_vec = np.zeros(6)  # Направление пластического течения (dg/d_sigma)
-
-                n_vec[2] = np.tan(self.phi)
-                m_vec[2] = np.tan(self.psi)
-
+                n_vec, m_vec = np.zeros(6), np.zeros(6)
+                n_vec[2], m_vec[2] = tan_phi, tan_psi
                 if tau > 0:
-                    n_vec[4] = m_vec[4] = sig_23 / tau  # Компонента yz
-                    n_vec[5] = m_vec[5] = sig_13 / tau  # Компонента xz
+                    n_vec[4] = m_vec[4] = s23 / tau
+                    n_vec[5] = m_vec[5] = s13 / tau
 
                 D_m = self.D_eq_local @ m_vec
                 n_D = n_vec @ self.D_eq_local
@@ -224,35 +223,27 @@ class UbiquitousJointModel3D(ConstitutiveModel):
 
                 if abs(denom) > 1e-12:
                     D_ep = self.D_eq_local - np.outer(D_m, n_D) / denom
-
-                    # ТОЧНАЯ АЛГОРИТМИЧЕСКАЯ КОРРЕКЦИЯ (Algorithmic Tangent Operator)
-                    # Учитывает кривизну конуса при радиальном возврате.
-                    # Сдвиговая жесткость в направлении, перпендикулярном радиальному вектору,
-                    # должна быть домножена на коэффициент beta = tau_new / tau_trial.
                     if tau > 0:
                         beta = tau_new / tau
-                        n_s4 = sig_23 / tau
-                        n_s5 = sig_13 / tau
-
-                        # Матрица снижения жесткости из-за кривизны (delta_D)
                         delta_D = np.zeros((6, 6))
-                        delta_D[4, 4] = self.alpha_2 * (1.0 - n_s4 * n_s4)
-                        delta_D[5, 5] = self.alpha_2 * (1.0 - n_s5 * n_s5)
-                        delta_D[4, 5] = delta_D[5, 4] = -self.alpha_2 * n_s4 * n_s5
-
-                        # Итоговая алгоритмическая матрица
-                        D_tan_local = D_ep - (1.0 - beta) * delta_D
+                        delta_D[4, 4] = self.alpha_2 * (1 - (s23 / tau) ** 2)
+                        delta_D[5, 5] = self.alpha_2 * (1 - (s13 / tau) ** 2)
+                        delta_D[4, 5] = delta_D[5, 4] = -self.alpha_2 * (s23 / tau) * (s13 / tau)
+                        D_tan_l = D_ep - (1 - beta) * delta_D
                     else:
-                        D_tan_local = D_ep
+                        D_tan_l = D_ep
 
-        # 5. Обратный перевод скорректированных напряжений и КАСАТЕЛЬНОЙ МАТРИЦЫ в глобальные оси
-        global_stress_tensor = self.R @ local_stress @ self.R.T
-        self.stress = self._stress_tensor_to_voigt(global_stress_tensor)
+        # Обратный перевод напряжений и касательной матрицы
+        st_g = self.R @ sig_tr_l_t @ self.R.T
+        self.stress = np.array([st_g[0, 0], st_g[1, 1], st_g[2, 2], st_g[0, 1], st_g[1, 2], st_g[0, 2]])
 
-        # Вращение согласованной матрицы
-        D_tan_global = self._rotate_stiffness_matrix(D_tan_local, self.R)
+        return self.stress, self._rotate_matrix(D_tan_l, self.R)
 
-        return self.stress, D_tan_global
+    def get_tangent_matrix(self):
+        return self.D_eq_global
+
+    def get_stress(self, strain):
+        return self.stress
 
     def commit(self):
         self.stress_old = self.stress.copy()
