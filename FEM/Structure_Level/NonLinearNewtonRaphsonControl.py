@@ -20,8 +20,8 @@ class NonLinearNewtonRaphsonControl(Control):
 
         total_dofs = self.model.total_dofs
 
-        # Глобальный вектор полных перемещений
-        U_global = np.zeros(total_dofs)
+        # Глобальный вектор полных перемещений делаем атрибутом класса
+        self.U_global = np.zeros(total_dofs)
 
         # Собираем базовый вектор внешних сил
         F_ext_ref = np.zeros(total_dofs)
@@ -47,7 +47,7 @@ class NonLinearNewtonRaphsonControl(Control):
                         el_dofs.extend(node.dofs)
 
                     # Извлекаем текущие полные перемещения узлов элемента
-                    U_el = U_global[el_dofs]
+                    U_el = self.U_global[el_dofs]
 
                     # Вычисляем матрицу и внутренние силы элемента
                     K_e, F_int_e = self._compute_element_nonlinear(element, U_el)
@@ -101,12 +101,17 @@ class NonLinearNewtonRaphsonControl(Control):
                 print(f"  Итерация {iteration}: Невязка = {error:.6e} (Отн. = {error_rel:.6e})")
 
                 if np.isnan(error) or np.isinf(error):
-                    print("КРИТИЧЕСКАЯ ОШИБКА: Решение разошлость (NaN/Inf). Матрица стала сингулярной.")
+                    print("КРИТИЧЕСКАЯ ОШИБКА: Решение разошлось (NaN/Inf). Матрица стала сингулярной.")
                     return
 
                 # Критерий выхода (сходимость)
                 if error_rel < self.tol and error < self.tol and iteration > 0:
                     print(f"  Сходимость достигнута за {iteration} итераций!")
+
+                    # ОБНОВЛЕНО: Записываем перемещения в узлы сразу после сходимости шага
+                    for node in self.model.nodes:
+                        node.displacements = self.U_global[node.dofs]
+
                     self._commit_state()
                     break
 
@@ -118,16 +123,14 @@ class NonLinearNewtonRaphsonControl(Control):
                     return
 
                 # 6. Обновление вектора перемещений
-                U_global += dU
+                self.U_global += dU
 
             else:
                 print("ВНИМАНИЕ: Сходимость не достигнута за максимальное число итераций!")
                 # Даже если не сошлись, фиксируем состояние, чтобы попытаться пройти дальше
+                for node in self.model.nodes:
+                    node.displacements = self.U_global[node.dofs]
                 self._commit_state()
-
-        # Запись финальных перемещений обратно в узлы модели
-        for node in self.model.nodes:
-            node.displacements = U_global[node.dofs]
 
         print("\nРасчет завершен!")
 

@@ -3,7 +3,7 @@ import os
 # Настройки
 OUTPUT_FILE = "project_context.txt"
 EXTENSIONS = {".py"}  # Какие файлы собирать
-IGNORE_DIRS = {".git", "__pycache__", ".venv", "venv", ".idea", ".vscode", ".Tests"}  # Что игнорировать
+IGNORE_DIRS = {".git", "__pycache__", ".venv", "venv", ".idea", ".vscode", "Tests"}  # Что игнорировать
 
 
 def create_context():

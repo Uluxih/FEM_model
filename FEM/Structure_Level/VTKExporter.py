@@ -1,5 +1,5 @@
 # ====================================
-# File: .\FEM\Structure_Level\VTK_Exporter.py
+# File: .\FEM\Structure_Level\VTKExporter.py
 # ====================================
 import os
 
@@ -76,5 +76,20 @@ class VTKExporter:
                 v = disp[1] if len(disp) > 1 else 0.0
                 w = disp[2] if len(disp) > 2 else 0.0
                 f.write(f"{u:.6e} {v:.6e} {w:.6e}\n")
+
+            # 6. Запись данных элементов (CELL_DATA)
+            f.write(f"\nCELL_DATA {num_elements}\n")
+
+            # Векторное поле: Нормаль трещины (Joint Normal)
+            f.write("VECTORS JointNormal float\n")
+            for el in model.elements:
+                nx, ny, nz = 0.0, 0.0, 0.0
+                # Пытаемся извлечь нормаль из первой точки интегрирования элемента
+                if len(el.integration_points) > 0:
+                    c_model = el.integration_points[0].constitutive_model
+                    # Проверяем, есть ли у модели материал и есть ли у материала нормаль
+                    if hasattr(c_model, 'mat') and hasattr(c_model.mat, 'normal'):
+                        nx, ny, nz = c_model.mat.normal
+                f.write(f"{nx:.6f} {ny:.6f} {nz:.6f}\n")
 
         print("Готово!")

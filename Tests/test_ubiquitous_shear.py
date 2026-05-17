@@ -125,7 +125,6 @@ class MultiElementNRControl(Control):
                     ip.constitutive_model.commit()
 
             # --- ОБНОВЛЕНИЕ ПЕРЕМЕЩЕНИЙ В УЗЛАХ И ЭКСПОРТ В VTK ---
-            # Записываем перемещения обратно в модель, чтобы их увидел VTKExporter
             for node in self.model.nodes:
                 node.displacements = U_global[node.dofs]
 
@@ -169,7 +168,6 @@ def generate_block_mesh(Lx, Ly, Lz, nx, ny, nz, material, factory):
     model = FEModel()
     model.materials.append(material)
 
-    # Создание узлов
     node_id = 0
     nodes_dict = {}
     for k in range(nz + 1):
@@ -183,11 +181,9 @@ def generate_block_mesh(Lx, Ly, Lz, nx, ny, nz, material, factory):
                 nodes_dict[(i, j, k)] = n
                 node_id += 1
 
-    # Создание элементов
     for k in range(nz):
         for j in range(ny):
             for i in range(nx):
-                # Индексы 8 узлов для HEX8 (против часовой снизу, затем сверху)
                 n1 = nodes_dict[(i, j, k)]
                 n2 = nodes_dict[(i + 1, j, k)]
                 n3 = nodes_dict[(i + 1, j + 1, k)]
@@ -208,18 +204,28 @@ def generate_block_mesh(Lx, Ly, Lz, nx, ny, nz, material, factory):
 # 4. ЗАПУСК ТЕСТА
 # ==========================================
 def run_multi_element_test():
-    print("=== ТЕСТ: Сдвиг колонны (Ubiquitous Joint, Много элементов) ===")
+    print("=== ТЕСТ: Сдвиг колонны (Ubiquitous Joint - Строгая последовательная модель) ===")
 
-    # 1. Материал
+    # 1. Задаем реалистичные параметры для горной породы (СИ: Паскали, метры)
     joint_params = {
-        'kn': 500.0, 'ks': 10000000.0, 'kt': 1000000.0,
-        'spacing': 0.2,  # Трещины каждые 20 см
-        'c': 1.5,  # Сцепление 1.5 МПа
-        'phi': 25.0,  # Угол трения 25 град
-        'psi': 0.0,
-        't': 10.5  # Предел на растяжение 0.5 МПа
+        # Параметры жесткости трещины (добавлены для последовательной модели C_eq = C_rock + C_joint)
+        'kn': 50.0e7,  # Нормальная жесткость: 50 ГПа/м
+        'ks': 10.0e7,  # Сдвиговая жесткость: 10 ГПа/м
+        'kt': 10.0e7,  # Сдвиговая жесткость: 10 ГПа/м
+        'spacing': 0.2,  # Расстояние между трещинами: 20 см
+
+        # Параметры прочности трещины
+        'c': 1.5e6,  # Сцепление: 1.5 МПа
+        'phi': 0.0,  # Угол внутреннего трения: 30°
+        'psi': 0.0,  # Угол дилатансии: 5°
+        't': 0.5e6,  # Предел прочности на растяжение: 0.5 МПа
+
+        # Ориентация трещины
+        'normal': [0, 0, 1]  # Горизонтальная трещина
     }
-    material = JointedMaterial(E=20000.0, nu=0.2, joint_params=joint_params)
+
+    # Модуль Юнга породы: 20 ГПа, Коэф. Пуассона: 0.2
+    material = JointedMaterial(E=20.0e9, nu=0.2, joint_params=joint_params)
     factory = HEX8Factory()
 
     # 2. Генерация сетки: Колонна 1м x 1м x 2м (разбиение 2x2x4 = 16 элементов)
@@ -239,23 +245,24 @@ def run_multi_element_test():
         # Нагружение верхней грани (Z = 2.0)
         elif abs(node.coords[2] - 2.0) < 1e-6:
             top_nodes.append(node)
-            model.add_bc(node, 1, 0.0)  # Блокируем Y
-            model.add_bc(node, 2, -0.002)  # Обжатие по Z (2 мм)
-            model.add_bc(node, 0, 0.010)  # Сдвиг по X (10 мм)
+            model.add_bc(node, 1, 0.0)  # Блокируем перемещения по Y
+            # model.add_bc(node, 2, 0.000)  # Блокируем перемещения по Z (нет обжатия/отрыва)
+            model.add_bc(node, 0, 01.1)  # Сдвиг по X на 10 мм
 
-    # 4. Решение
-    # 20 шагов нагрузки. Макс. итераций = 100
-    control = MultiElementNRControl(model=model, track_nodes=top_nodes, num_steps=20, max_iter=100)
+    # 4. Решение (20 шагов)
+    control = MultiElementNRControl(model=model, track_nodes=top_nodes, num_steps=80, max_iter=200)
     control.solve()
 
     # 5. Построение графика
     ux_mm = [u * 1000 for u in control.history_Ux]
-    fx_mn = [abs(f) for f in control.history_Fx]
+
+    # Переводим силу из Ньютонов в МегаНьютоны (МН) для графика
+    fx_mn = [abs(f) / 1e6 for f in control.history_Fx]
 
     plt.figure(figsize=(9, 6))
     plt.plot(ux_mm, fx_mn, marker='s', color='#d62728', linewidth=2, markersize=5)
 
-    plt.title("Сдвиг колонны 2x2x4 элементов (Ubiquitous Joint)", fontsize=14)
+    plt.title("Сдвиг колонны 2x2x4 (Строгая последовательная модель)", fontsize=14)
     plt.xlabel("Горизонтальное перемещение верхней грани Ux (мм)", fontsize=12)
     plt.ylabel("Суммарная сдвигающая реакция Fx (МН)", fontsize=12)
 
