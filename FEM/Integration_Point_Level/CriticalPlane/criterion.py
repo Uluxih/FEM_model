@@ -4,6 +4,7 @@ import pytest
 from FEM.Integration_Point_Level.CriticalPlane.tensor import StressTensor
 import FEM.Integration_Point_Level.CriticalPlane.material as mt
 
+
 # ==========================================
 # ДОБАВЛЕНО: Функция вычисления вектора нормали
 # ==========================================
@@ -42,10 +43,10 @@ def global_maximize(objective_func, mode='3D'):
     best_f = -float('inf')
 
     starting_points = [
-        [0, 0],                  # Z
-        [np.pi / 2, 0],          # X
+        [0, 0],  # Z
+        [np.pi / 2, 0],  # X
         [np.pi / 2, np.pi / 2],  # Y
-        [np.pi / 4, np.pi / 4]   # диагональ
+        [np.pi / 4, np.pi / 4]  # диагональ
     ]
 
     for x0 in starting_points:
@@ -58,14 +59,20 @@ def global_maximize(objective_func, mode='3D'):
 
 
 # ==========================================
-# 1. КРИТЕРИЙ СДВИГА
+# НОВЫЙ БЛОК: ОТДЕЛЬНЫЕ ФУНКЦИИ ПРЕДЕЛОВ ПРОЧНОСТИ
 # ==========================================
-def calculate_criterion_shear(params, stress_tensor, material:mt.Material, mode='3D'):
-    mu=material.mu
-    A_tensor=material.A_tensor
+def get_tensile_limit(n, material: mt.Material):
+    """Вычисляет предел прочности на растяжение на заданной площадке"""
+    return material.Rpx * n[0] ** 2 + material.Rpy * n[1] ** 2 + material.Rpz * n[2] ** 2
 
-    n = get_normal_vector(params, mode)
-    sigma_n = stress_tensor.normal_stress(n)
+
+def get_compression_limit(n, material: mt.Material):
+    """Вычисляет предел прочности на сжатие на заданной площадке"""
+    return material.Rcx * n[0] ** 2 + material.Rcy * n[1] ** 2 + material.Rcz * n[2] ** 2
+
+
+def get_cohesion_limit(n, stress_tensor: StressTensor, material: mt.Material):
+    """Вычисляет предельное сцепление (C) на площадке с учетом направления сдвига"""
     tau_n = stress_tensor.shear_stress_magnitude(n)
 
     # Направление сдвига (s_geom) – единичный вектор в плоскости площадки
@@ -79,27 +86,31 @@ def calculate_criterion_shear(params, stress_tensor, material:mt.Material, mode=
             s_geom = np.cross(n, np.array([1, 0, 0]))
         s_geom = s_geom / np.linalg.norm(s_geom)
 
-    # Вычисление C = sqrt(v·A·v), где v = n⊗s
-    C_val = material.get_cohesion(n, s_geom)
+    return material.get_cohesion(n, s_geom)
+
+
+# ==========================================
+# 1. КРИТЕРИЙ СДВИГА
+# ==========================================
+def calculate_criterion_shear(params, stress_tensor, material: mt.Material, mode='3D'):
+    n = get_normal_vector(params, mode)
+    sigma_n = stress_tensor.normal_stress(n)
+    tau_n = stress_tensor.shear_stress_magnitude(n)
+
+    # Используем новую отдельную функцию вычисления сцепления
+    C_val = get_cohesion_limit(n, stress_tensor, material)
 
     # Сопротивление сдвигу
-    mu_tens = material.mu_tensile  # коэффициент трения при растяжении
     if sigma_n > 0:
-        resistance = C_val + mu_tens * sigma_n
-
+        resistance = C_val + material.mu_tensile * sigma_n
     else:
-        resistance = C_val + mu * sigma_n
-
+        resistance = C_val + material.mu * sigma_n
 
     f_val = tau_n - resistance
     return f_val, n, tau_n, resistance
 
 
 def find_critical_plane_shear(stress_tensor, material, mode='3D'):
-
-    mu=material.mu
-    A_tensor=material.A_tensor
-
     def objective(p):
         f_val, _, _, _ = calculate_criterion_shear(p, stress_tensor, material, mode)
         return -f_val
@@ -125,20 +136,17 @@ def find_critical_plane_shear(stress_tensor, material, mode='3D'):
 # 2. КРИТЕРИЙ РАСТЯЖЕНИЯ
 # ==========================================
 def calculate_criterion_tensile(params, stress_tensor, material, mode='3D'):
-    Rpx=material.Rpx
-    Rpy=material.Rpy
-    Rpz=material.Rpz
     n = get_normal_vector(params, mode)
     sigma_n = stress_tensor.normal_stress(n)
-    Rp_n = Rpx * n[0] ** 2 + Rpy * n[1] ** 2 + Rpz * n[2] ** 2
+
+    # Используем новую отдельную функцию вычисления предела растяжения
+    Rp_n = get_tensile_limit(n, material)
+
     f_val = sigma_n - Rp_n
     return f_val, n, sigma_n, Rp_n
 
 
 def find_critical_plane_tensile(stress_tensor, material, mode='3D'):
-    Rpx=material.Rpx
-    Rpy=material.Rpy
-    Rpz=material.Rpz
     def objective(p):
         f_val, _, _, _ = calculate_criterion_tensile(p, stress_tensor, material, mode='3D')
         return -f_val
@@ -164,20 +172,17 @@ def find_critical_plane_tensile(stress_tensor, material, mode='3D'):
 # 3. КРИТЕРИЙ СЖАТИЯ
 # ==========================================
 def calculate_criterion_compression(params, stress_tensor, material, mode='3D'):
-    Rcx=material.Rcx
-    Rcy=material.Rcy
-    Rcz=material.Rcz
     n = get_normal_vector(params, mode)
     sigma_n = stress_tensor.normal_stress(n)
-    Rc_n = Rcx * n[0] ** 2 + Rcy * n[1] ** 2 + Rcz * n[2] ** 2
+
+    # Используем новую отдельную функцию вычисления предела сжатия
+    Rc_n = get_compression_limit(n, material)
+
     f_val = -sigma_n - Rc_n
     return f_val, n, sigma_n, Rc_n
 
 
 def find_critical_plane_compression(stress_tensor, material, mode='3D'):
-    Rcx=material.Rcx
-    Rcy=material.Rcy
-    Rcz=material.Rcz
     def objective(p):
         f_val, _, _, _ = calculate_criterion_compression(p, stress_tensor, material, mode)
         return -f_val

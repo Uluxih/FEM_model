@@ -501,12 +501,12 @@ class ElasticModel3D(ConstitutiveModel):
 
 
 ====================
-File: .\FEM\Integration_Point_Level\UbiquitousJointModel3D.py
+File: .\FEM\Integration_Point_Level\FixedHorizontalCrackModel3D.py
 ====================
 
 import numpy as np
 
-# Импортируем ваши модули для поиска критической плоскости
+# Импортируем модули для поиска критической плоскости
 from FEM.Integration_Point_Level.CriticalPlane.criterion import (
     find_critical_plane_shear,
     find_critical_plane_tensile
@@ -515,12 +515,12 @@ from FEM.Integration_Point_Level.CriticalPlane.tensor import StressTensor
 from FEM.Abstract.Integration_Point_Level import ConstitutiveModel
 
 
-class UbiquitousJointModel3D(ConstitutiveModel):
+class FixedHorizontalCrackModel3D(ConstitutiveModel):
     """
-    Адаптивная модель сплошной среды с фиксацией трещины (Fixed Smeared Crack).
-    - До разрушения: Изотропная упругая порода.
-    - При разрушении: Ищет критическую плоскость и фиксирует её.
-    - После разрушения: Строгая модель Ubiquitous Joint с согласованной матрицей.
+    Модель с фиксированной горизонтальной трещиной.
+    - До разрушения: Изотропная упругая порода (высокая жесткость).
+    - При разрушении: Игнорирует реальный угол и принудительно фиксирует плоскость (0, 0, 1).
+    - После разрушения: Строгая модель Ubiquitous Joint с согласованной матрицей и сниженной жесткостью.
     """
 
     def __init__(self, material):
@@ -545,7 +545,7 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         # --- 2. Параметры поиска (Critical Plane Material) ---
         self.cp_material = jp.get('cp_material', None)
         if self.cp_material is None:
-            raise ValueError("Для адаптивной модели необходимо передать 'cp_material' в joint_params!")
+            raise ValueError("Для модели необходимо передать 'cp_material' в joint_params!")
 
         # --- 3. Упругая матрица целой породы (действует ДО фиксации) ---
         self.C_rock = self._build_isotropic_compliance(E, nu)
@@ -553,7 +553,7 @@ class UbiquitousJointModel3D(ConstitutiveModel):
 
         # --- 4. Переменные состояния фиксации ---
         self.is_locked = False
-        self.fixed_normal = None
+        self.fixed_normal = np.array([0.0, 0.0, 1.0]) # Площадка всегда фиксирована как горизонтальная
 
         # Заглушки для матриц, которые будут построены при фиксации
         self.R = np.eye(3)
@@ -587,6 +587,7 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         nz = np.array(n) / np.linalg.norm(n)
         if abs(nz[2]) > 0.999:
             nx = np.array([1.0, 0.0, 0.0])
+            ny = np.cross(nz, nx)
         else:
             ny = np.cross(nz, [0.0, 0.0, 1.0])
             ny /= np.linalg.norm(ny)
@@ -598,7 +599,7 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         """Вращение матрицы жесткости 6x6"""
         D_glob = np.zeros((6, 6))
         for j in range(6):
-            e_g = np.zeros(6);
+            e_g = np.zeros(6)
             e_g[j] = 1.0
             et_g = np.array(
                 [[e_g[0], e_g[3] / 2, e_g[5] / 2], [e_g[3] / 2, e_g[1], e_g[4] / 2], [e_g[5] / 2, e_g[4] / 2, e_g[2]]])
@@ -612,12 +613,11 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         return D_glob
 
     def _voigt_to_stresstensor(self, v):
-        """Конвертация вектора Фойгта в ваш объект StressTensor"""
+        """Конвертация вектора Фойгта в объект StressTensor"""
         return StressTensor(v[0], v[1], v[2], v[3], v[4], v[5])
 
     def _lock_plane(self, normal):
-        """Процедура фиксации трещины и перестроения матриц жесткости"""
-        self.fixed_normal = normal
+        """Процедура фиксации заданой трещины и перестроения матриц жесткости"""
         self.R = self._build_rotation_matrix(normal)
 
         # Добавляем податливость трещины к породе
@@ -633,37 +633,36 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         self.D_eq_global = self._rotate_matrix(self.D_eq_local, self.R)
         self.is_locked = True
 
-        print(f" [!] ОБРАЗОВАНИЕ ТРЕЩИНЫ. Нормаль зафиксирована: [{normal[0]:.3f}, {normal[1]:.3f}, {normal[2]:.3f}]")
+        print(f" [!] ОБРАЗОВАНИЕ ТРЕЩИНЫ. Принудительно зафиксирована горизонтальная нормаль: [{normal[0]:.3f}, {normal[1]:.3f}, {normal[2]:.3f}]")
 
     def update_state(self, current_strain):
         self.strain = current_strain
         d_strain = current_strain - self.strain_old
 
         # ==========================================================
-        # ЭТАП 1: ПОИСК И ФИКСАЦИЯ (Если трещина еще не образовалась)
+        # ЭТАП 1: ДО РАЗРУШЕНИЯ (Упругая порода)
         # ==========================================================
         if not self.is_locked:
-            # Считаем пробное напряжение как для целой породы
+            # Считаем пробное напряжение как для целой породы (Высокая жесткость)
             stress_trial_rock = self.stress_old + self.D_rock @ d_strain
             st = self._voigt_to_stresstensor(stress_trial_rock)
 
-            # Ищем критическую плоскость
+            # Ищем, разрушилась ли порода в принципе (по свойствам целой породы)
             f_sh, n_sh, util_sh = find_critical_plane_shear(st, self.cp_material, mode='3D')
             f_t, n_t, util_t = find_critical_plane_tensile(st, self.cp_material, mode='3D')
 
             max_f = max(f_sh, f_t)
 
             if max_f > 0:
-                # Порода не выдержала! Фиксируем плоскость.
-                best_n = n_sh if f_sh > f_t else n_t
-                self._lock_plane(best_n)
+                # Порода не выдержала! ВМЕСТО найденной нормали жестко фиксируем (0,0,1)
+                self._lock_plane(self.fixed_normal)
             else:
                 # Порода держит нагрузку. Возвращаем упругое состояние.
                 self.stress = stress_trial_rock
                 return self.stress, self.D_rock
 
         # ==========================================================
-        # ЭТАП 2: РАБОТА С ЗАФИКСИРОВАННОЙ ТРЕЩИНОЙ (Return Mapping)
+        # ЭТАП 2: РАБОТА С ЗАФИКСИРОВАННОЙ ТРЕЩИНОЙ (Сниженная жесткость)
         # ==========================================================
         # Считаем пробное напряжение уже с учетом податливости трещины (D_eq_global)
         sig_tr_v = self.stress_old + self.D_eq_global @ d_strain
@@ -677,7 +676,221 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         s33, s13, s23 = sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2]
         tau = np.sqrt(s13 ** 2 + s23 ** 2)
 
-        # Проверка критериев (на уже зафиксированной плоскости)
+        # Проверка критериев (на уже зафиксированной площадке 0,0,1)
+        f_s = tau + s33 * np.tan(self.phi) - self.c
+        f_t = s33 - self.t_limit
+
+        if f_s <= 0 and f_t <= 0:
+            self.stress = sig_tr_v
+            return self.stress, self.D_eq_global
+
+        # --- АЛГОРИТМИЧЕСКИЙ ВОЗВРАТ И СОГЛАСОВАННАЯ МАТРИЦА ---
+        D_tan_l = self.D_eq_local.copy()
+
+        if f_t > 0 or (f_s > 0 and (s33 + (f_s / self.alpha_2) * self.alpha_1 * np.tan(self.psi)) > self.t_limit):
+            # Отрыв
+            sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2] = self.t_limit, 0, 0
+            D_tan_l[2, :] = 0; D_tan_l[:, 2] = 0
+            D_tan_l[4, :] = 0; D_tan_l[:, 4] = 0
+            D_tan_l[5, :] = 0; D_tan_l[:, 5] = 0
+        else:
+            # Сдвиг
+            tan_phi, tan_psi = np.tan(self.phi), np.tan(self.psi)
+            lam = f_s / (self.alpha_2 + self.alpha_1 * tan_phi * tan_psi)
+
+            sig_33_new = s33 - lam * self.alpha_1 * tan_psi
+            tau_new = tau - lam * self.alpha_2
+
+            apex_stress = self.c / tan_phi if self.phi > 0 else float('inf')
+
+            if sig_33_new > apex_stress:
+                sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2] = apex_stress, 0, 0
+                D_tan_l[2, :] = 0; D_tan_l[:, 2] = 0
+                D_tan_l[4, :] = 0; D_tan_l[:, 4] = 0
+                D_tan_l[5, :] = 0; D_tan_l[:, 5] = 0
+            else:
+                sig_tr_l_t[2, 2] = sig_33_new
+                if tau > 0:
+                    factor = tau_new / tau
+                    sig_tr_l_t[0, 2] *= factor
+                    sig_tr_l_t[1, 2] *= factor
+
+                n_vec, m_vec = np.zeros(6), np.zeros(6)
+                n_vec[2], m_vec[2] = tan_phi, tan_psi
+                if tau > 0:
+                    n_vec[4] = m_vec[4] = s23 / tau
+                    n_vec[5] = m_vec[5] = s13 / tau
+
+                D_m = self.D_eq_local @ m_vec
+                n_D = n_vec @ self.D_eq_local
+                denom = np.dot(n_vec, D_m)
+
+                if abs(denom) > 1e-12:
+                    D_ep = self.D_eq_local - np.outer(D_m, n_D) / denom
+                    if tau > 0:
+                        beta = tau_new / tau
+                        delta_D = np.zeros((6, 6))
+                        delta_D[4, 4] = self.alpha_2 * (1 - (s23 / tau) ** 2)
+                        delta_D[5, 5] = self.alpha_2 * (1 - (s13 / tau) ** 2)
+                        delta_D[4, 5] = delta_D[5, 4] = -self.alpha_2 * (s23 / tau) * (s13 / tau)
+                        D_tan_l = D_ep - (1 - beta) * delta_D
+                    else:
+                        D_tan_l = D_ep
+
+        # Обратный перевод напряжений и касательной матрицы
+        st_g = self.R @ sig_tr_l_t @ self.R.T
+        self.stress = np.array([st_g[0, 0], st_g[1, 1], st_g[2, 2], st_g[0, 1], st_g[1, 2], st_g[0, 2]])
+
+        return self.stress, self._rotate_matrix(D_tan_l, self.R)
+
+    def get_tangent_matrix(self):
+        return self.D_eq_global if self.is_locked else self.D_rock
+
+    def get_stress(self, strain):
+        return self.stress
+
+    def commit(self):
+        self.stress_old = self.stress.copy()
+        self.strain_old = self.strain.copy()
+
+
+====================
+File: .\FEM\Integration_Point_Level\FixedHorizontalJointModel3D.py
+====================
+
+import numpy as np
+from FEM.Abstract.Integration_Point_Level import ConstitutiveModel
+
+
+class FixedHorizontalJointModel3D(ConstitutiveModel):
+    """
+    Строгая модель Ubiquitous Joint с заранее заданной горизонтальной плоскостью ослабления (0, 0, 1).
+    - Не ищет критическую плоскость.
+    - Сразу инициализируется с учетом податливости горизонтальной трещины.
+    - Выполняет алгоритм Return Mapping для сдвига и отрыва.
+    """
+
+    def __init__(self, material):
+        super().__init__(material)
+
+        E = self.material.E
+        nu = self.material.nu
+        jp = self.material.joint_params
+
+        # --- 1. Параметры трещины ---
+        self.kn, self.ks, self.kt, self.S = jp['kn'], jp['ks'], jp['kt'], jp['spacing']
+        self.c = jp.get('c', 0.0)
+        self.phi = np.radians(jp.get('phi', 0.0))
+        self.psi = np.radians(jp.get('psi', 0.0))
+        self.t_limit = jp.get('t', 0.0)
+
+        # Ограничение на растяжение (Apex correction)
+        if self.phi > 0:
+            t_max = self.c / np.tan(self.phi)
+            self.t_limit = min(self.t_limit, t_max)
+
+        # --- 2. Упругая матрица целой породы ---
+        self.C_rock = self._build_isotropic_compliance(E, nu)
+        self.D_rock = np.linalg.inv(self.C_rock)
+
+        # --- 3. Переменные состояния напряжений/деформаций ---
+        self.stress_old = np.zeros(6)
+        self.strain_old = np.zeros(6)
+        self.stress = np.zeros(6)
+        self.strain = np.zeros(6)
+
+        # --- 4. Фиксация горизонтальной плоскости (0, 0, 1) ---
+        self.fixed_normal = np.array([0.0, 0.0, 1.0])
+        self.R = np.eye(3)  # Для (0,0,1) матрица поворота - это единичная матрица
+        self.D_eq_local = None
+        self.D_eq_global = None
+        self.alpha_1 = 0.0
+        self.alpha_2 = 0.0
+
+        # Сразу вызываем процедуру фиксации
+        self._lock_plane(self.fixed_normal)
+
+    def _build_isotropic_compliance(self, E, nu):
+        C = np.zeros((6, 6))
+        G = E / (2.0 * (1.0 + nu))
+        C[0, 0] = C[1, 1] = C[2, 2] = 1.0 / E
+        C[0, 1] = C[0, 2] = C[1, 0] = C[1, 2] = C[2, 0] = C[2, 1] = -nu / E
+        C[3, 3] = C[4, 4] = C[5, 5] = 1.0 / G
+        return C
+
+    def _build_joint_compliance(self, kn, ks, kt, S):
+        C = np.zeros((6, 6))
+        C[2, 2] = 1.0 / (kn * S)
+        C[4, 4] = 1.0 / (kt * S)
+        C[5, 5] = 1.0 / (ks * S)
+        return C
+
+    def _build_rotation_matrix(self, n):
+        nz = np.array(n) / np.linalg.norm(n)
+        if abs(nz[2]) > 0.999:
+            nx = np.array([1.0, 0.0, 0.0])
+            ny = np.cross(nz, nx)
+        else:
+            ny = np.cross(nz, [0.0, 0.0, 1.0])
+            ny /= np.linalg.norm(ny)
+            nx = np.cross(ny, nz)
+        nx /= np.linalg.norm(nx)
+        return np.column_stack((nx, ny, nz))
+
+    def _rotate_matrix(self, D, R):
+        """Вращение матрицы жесткости 6x6"""
+        D_glob = np.zeros((6, 6))
+        for j in range(6):
+            e_g = np.zeros(6)
+            e_g[j] = 1.0
+            et_g = np.array(
+                [[e_g[0], e_g[3] / 2, e_g[5] / 2], [e_g[3] / 2, e_g[1], e_g[4] / 2], [e_g[5] / 2, e_g[4] / 2, e_g[2]]])
+            et_l = R.T @ et_g @ R
+            ev_l = np.array([et_l[0, 0], et_l[1, 1], et_l[2, 2], 2 * et_l[0, 1], 2 * et_l[1, 2], 2 * et_l[0, 2]])
+
+            sv_l = D @ ev_l
+            st_l = np.array([[sv_l[0], sv_l[3], sv_l[5]], [sv_l[3], sv_l[1], sv_l[4]], [sv_l[5], sv_l[4], sv_l[2]]])
+            st_g = R @ st_l @ R.T
+            D_glob[:, j] = np.array([st_g[0, 0], st_g[1, 1], st_g[2, 2], st_g[0, 1], st_g[1, 2], st_g[0, 2]])
+        return D_glob
+
+    def _lock_plane(self, normal):
+        """Процедура инициализации матриц жесткости для заданной плоскости"""
+        self.R = self._build_rotation_matrix(normal)
+
+        # Добавляем податливость трещины к породе
+        C_joint_local = self._build_joint_compliance(self.kn, self.ks, self.kt, self.S)
+        C_eq_local = self.C_rock + C_joint_local
+        self.D_eq_local = np.linalg.inv(C_eq_local)
+
+        # Модули для Return Mapping
+        self.alpha_1 = self.D_eq_local[2, 2]
+        self.alpha_2 = (self.D_eq_local[4, 4] + self.D_eq_local[5, 5]) / 2.0
+
+        # Глобальная эквивалентная матрица с учетом трещины
+        self.D_eq_global = self._rotate_matrix(self.D_eq_local, self.R)
+
+    def update_state(self, current_strain):
+        self.strain = current_strain
+        d_strain = current_strain - self.strain_old
+
+        # ==========================================================
+        # РАБОТА С ЗАФИКСИРОВАННОЙ ТРЕЩИНОЙ (Return Mapping)
+        # ==========================================================
+        # Считаем пробное напряжение с учетом податливости трещины (D_eq_global)
+        sig_tr_v = self.stress_old + self.D_eq_global @ d_strain
+
+        # Перевод в локальные оси трещины (для нормали (0,0,1) локальные оси совпадают с глобальными,
+        # но мы оставляем умножение для полной математической строгости)
+        st_t = np.array([[sig_tr_v[0], sig_tr_v[3], sig_tr_v[5]],
+                         [sig_tr_v[3], sig_tr_v[1], sig_tr_v[4]],
+                         [sig_tr_v[5], sig_tr_v[4], sig_tr_v[2]]])
+        sig_tr_l_t = self.R.T @ st_t @ self.R
+
+        s33, s13, s23 = sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2]
+        tau = np.sqrt(s13 ** 2 + s23 ** 2)
+
+        # Проверка критериев
         f_s = tau + s33 * np.tan(self.phi) - self.c
         f_t = s33 - self.t_limit
 
@@ -752,6 +965,287 @@ class UbiquitousJointModel3D(ConstitutiveModel):
 
     def get_tangent_matrix(self):
         return self.D_eq_global
+
+    def get_stress(self, strain):
+        return self.stress
+
+    def commit(self):
+        self.stress_old = self.stress.copy()
+        self.strain_old = self.strain.copy()
+
+
+====================
+File: .\FEM\Integration_Point_Level\UbiquitousJointModel3D.py
+====================
+
+import numpy as np
+
+# Импортируем модули для поиска критической плоскости
+from FEM.Integration_Point_Level.CriticalPlane.criterion import (
+    find_critical_plane_shear,
+    find_critical_plane_tensile
+)
+from FEM.Integration_Point_Level.CriticalPlane.tensor import StressTensor
+from FEM.Abstract.Integration_Point_Level import ConstitutiveModel
+
+
+class UbiquitousJointModel3D(ConstitutiveModel):
+    """
+    Адаптивная модель сплошной среды с фиксацией трещины (Fixed Smeared Crack).
+    - До разрушения: Изотропная упругая порода.
+    - При разрушении: Ищет критическую плоскость, фиксирует её и вычисляет СЦЕПЛЕНИЕ (C) для этой плоскости.
+    - После разрушения: Строгая модель Ubiquitous Joint с согласованной матрицей.
+    """
+
+    def __init__(self, material):
+        super().__init__(material)
+
+        E = self.material.E
+        nu = self.material.nu
+        jp = self.material.joint_params
+
+        # --- 1. Параметры трещины ---
+        self.kn, self.ks, self.kt, self.S = jp['kn'], jp['ks'], jp['kt'], jp['spacing']
+        self.phi = np.radians(jp.get('phi', 0.0))
+        self.psi = np.radians(jp.get('psi', 0.0))
+
+        # Базовый предел прочности на отрыв (сохраняем, т.к. итоговый t_limit зависит от сцепления C)
+        self.t_limit_base = jp.get('t', 0.0)
+        self.t_limit = self.t_limit_base
+
+        # Сцепление теперь инициализируется нулем. Оно будет вычислено в момент образования трещины.
+        self.c = 0.0
+
+        # --- 2. Параметры поиска (Critical Plane Material) ---
+        self.cp_material = jp.get('cp_material', None)
+        if self.cp_material is None:
+            raise ValueError("Для адаптивной модели необходимо передать 'cp_material' в joint_params!")
+
+        # --- 3. Упругая матрица целой породы (действует ДО фиксации) ---
+        self.C_rock = self._build_isotropic_compliance(E, nu)
+        self.D_rock = np.linalg.inv(self.C_rock)
+
+        # --- 4. Переменные состояния фиксации ---
+        self.is_locked = False
+        self.fixed_normal = None
+
+        # Заглушки для матриц, которые будут построены при фиксации
+        self.R = np.eye(3)
+        self.D_eq_local = None
+        self.D_eq_global = self.D_rock.copy()
+        self.alpha_1 = 0.0
+        self.alpha_2 = 0.0
+
+        # Переменные состояния напряжений/деформаций
+        self.stress_old = np.zeros(6)
+        self.strain_old = np.zeros(6)
+        self.stress = np.zeros(6)
+        self.strain = np.zeros(6)
+
+    def _build_isotropic_compliance(self, E, nu):
+        C = np.zeros((6, 6))
+        G = E / (2.0 * (1.0 + nu))
+        C[0, 0] = C[1, 1] = C[2, 2] = 1.0 / E
+        C[0, 1] = C[0, 2] = C[1, 0] = C[1, 2] = C[2, 0] = C[2, 1] = -nu / E
+        C[3, 3] = C[4, 4] = C[5, 5] = 1.0 / G
+        return C
+
+    def _build_joint_compliance(self, kn, ks, kt, S):
+        C = np.zeros((6, 6))
+        C[2, 2] = 1.0 / (kn * S)
+        C[4, 4] = 1.0 / (kt * S)
+        C[5, 5] = 1.0 / (ks * S)
+        return C
+
+    def _build_rotation_matrix(self, n):
+        nz = np.array(n, dtype=float).flatten()
+        nz /= np.linalg.norm(nz)
+
+        if abs(nz[2]) > 0.999:
+            nx = np.array([1.0, 0.0, 0.0])
+            ny = np.cross(nz, nx)
+        else:
+            ny = np.cross(nz, [0.0, 0.0, 1.0])
+            ny /= np.linalg.norm(ny)
+            nx = np.cross(ny, nz)
+
+        nx /= np.linalg.norm(nx)
+        return np.column_stack((nx, ny, nz))
+
+    def _rotate_matrix(self, D, R):
+        D_glob = np.zeros((6, 6))
+        for j in range(6):
+            e_g = np.zeros(6)
+            e_g[j] = 1.0
+            et_g = np.array(
+                [[e_g[0], e_g[3] / 2, e_g[5] / 2], [e_g[3] / 2, e_g[1], e_g[4] / 2], [e_g[5] / 2, e_g[4] / 2, e_g[2]]])
+            et_l = R.T @ et_g @ R
+            ev_l = np.array([et_l[0, 0], et_l[1, 1], et_l[2, 2], 2 * et_l[0, 1], 2 * et_l[1, 2], 2 * et_l[0, 2]])
+
+            sv_l = D @ ev_l
+            st_l = np.array([[sv_l[0], sv_l[3], sv_l[5]], [sv_l[3], sv_l[1], sv_l[4]], [sv_l[5], sv_l[4], sv_l[2]]])
+            st_g = R @ st_l @ R.T
+            D_glob[:, j] = np.array([st_g[0, 0], st_g[1, 1], st_g[2, 2], st_g[0, 1], st_g[1, 2], st_g[0, 2]])
+        return D_glob
+
+    def _voigt_to_stresstensor(self, v):
+        return StressTensor(v[0], v[1], v[2], v[3], v[4], v[5])
+
+    def _lock_plane(self, normal, stress_tensor):
+        """Процедура фиксации трещины, вычисления C и перестроения матриц жесткости"""
+
+        self.fixed_normal = normal
+        self.R = self._build_rotation_matrix(normal)
+
+        # ==========================================================
+        # ИЗМЕНЕНИЕ: Динамический расчет сцепления (C) из cp_material
+        # ==========================================================
+        # 1. Находим вектор направления сдвига (s) на этой площадке
+        tau_n = stress_tensor.shear_stress_magnitude(normal)
+        if tau_n > 1e-9:
+            s_geom = stress_tensor.shear_stress_vector(normal) / tau_n
+        else:
+            # Если сдвига нет (например, чистое растяжение), берем произвольный ортогональный вектор
+            if abs(normal[2]) < 0.9:
+                s_geom = np.cross(normal, np.array([0, 0, 1]))
+            else:
+                s_geom = np.cross(normal, np.array([1, 0, 0]))
+            s_geom = s_geom / np.linalg.norm(s_geom)
+
+        # 2. Вычисляем сцепление для данной нормали и направления сдвига
+        self.c = self.cp_material.get_cohesion(normal, s_geom)
+
+        # 3. Пересчитываем ограничение на растяжение (Apex correction) с учетом нового C
+        self.t_limit = self.t_limit_base
+        if self.phi > 0:
+            t_max = self.c / np.tan(self.phi)
+            self.t_limit = min(self.t_limit, t_max)
+        # ==========================================================
+
+        # Добавляем податливость трещины к породе
+        C_joint_local = self._build_joint_compliance(self.kn, self.ks, self.kt, self.S)
+        C_eq_local = self.C_rock + C_joint_local
+        self.D_eq_local = np.linalg.inv(C_eq_local)
+
+        # Модули для Return Mapping
+        self.alpha_1 = self.D_eq_local[2, 2]
+        self.alpha_2 = (self.D_eq_local[4, 4] + self.D_eq_local[5, 5]) / 2.0
+
+        # Глобальная эквивалентная матрица с учетом трещины
+        self.D_eq_global = self._rotate_matrix(self.D_eq_local, self.R)
+        self.is_locked = True
+
+        print(
+            f" [!] ОБРАЗОВАНИЕ ТРЕЩИНЫ. Нормаль: [{normal[0]:.3f}, {normal[1]:.3f}, {normal[2]:.3f}] | Сцепление C = {self.c / 1e6:.2f} МПа")
+
+    def update_state(self, current_strain):
+        self.strain = current_strain
+        d_strain = current_strain - self.strain_old
+
+        # ==========================================================
+        # ЭТАП 1: ПОИСК И ФИКСАЦИЯ (Если трещина еще не образовалась)
+        # ==========================================================
+        if not self.is_locked:
+            stress_trial_rock = self.stress_old + self.D_rock @ d_strain
+            st = self._voigt_to_stresstensor(stress_trial_rock)
+
+            f_sh, n_sh, util_sh = find_critical_plane_shear(st, self.cp_material, mode='3D')
+            f_t, n_t, util_t = find_critical_plane_tensile(st, self.cp_material, mode='3D')
+
+            max_f = max(f_sh, f_t)
+
+            if max_f > 0:
+                best_n = n_sh if f_sh > f_t else n_t
+                # ИЗМЕНЕНИЕ: Передаем тензор напряжений в _lock_plane для расчета направления сдвига
+                self._lock_plane(best_n, st)
+            else:
+                self.stress = stress_trial_rock
+                return self.stress, self.D_rock
+
+        # ==========================================================
+        # ЭТАП 2: РАБОТА С ЗАФИКСИРОВАННОЙ ТРЕЩИНОЙ (Return Mapping)
+        # ==========================================================
+        sig_tr_v = self.stress_old + self.D_eq_global @ d_strain
+
+        st_t = np.array([[sig_tr_v[0], sig_tr_v[3], sig_tr_v[5]],
+                         [sig_tr_v[3], sig_tr_v[1], sig_tr_v[4]],
+                         [sig_tr_v[5], sig_tr_v[4], sig_tr_v[2]]])
+        sig_tr_l_t = self.R.T @ st_t @ self.R
+
+        s33, s13, s23 = sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2]
+        tau = np.sqrt(s13 ** 2 + s23 ** 2)
+
+        # Проверка критериев (на уже зафиксированной плоскости с НОВЫМ self.c)
+        f_s = tau + s33 * np.tan(self.phi) - self.c
+        f_t = s33 - self.t_limit
+
+        if f_s <= 0 and f_t <= 0:
+            self.stress = sig_tr_v
+            return self.stress, self.D_eq_global
+
+        D_tan_l = self.D_eq_local.copy()
+
+        if f_t > 0 or (f_s > 0 and (s33 + (f_s / self.alpha_2) * self.alpha_1 * np.tan(self.psi)) > self.t_limit):
+            sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2] = self.t_limit, 0, 0
+            D_tan_l[2, :] = 0;
+            D_tan_l[:, 2] = 0
+            D_tan_l[4, :] = 0;
+            D_tan_l[:, 4] = 0
+            D_tan_l[5, :] = 0;
+            D_tan_l[:, 5] = 0
+        else:
+            tan_phi, tan_psi = np.tan(self.phi), np.tan(self.psi)
+            lam = f_s / (self.alpha_2 + self.alpha_1 * tan_phi * tan_psi)
+
+            sig_33_new = s33 - lam * self.alpha_1 * tan_psi
+            tau_new = tau - lam * self.alpha_2
+
+            apex_stress = self.c / tan_phi if self.phi > 0 else float('inf')
+
+            if sig_33_new > apex_stress:
+                sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2] = apex_stress, 0, 0
+                D_tan_l[2, :] = 0;
+                D_tan_l[:, 2] = 0
+                D_tan_l[4, :] = 0;
+                D_tan_l[:, 4] = 0
+                D_tan_l[5, :] = 0;
+                D_tan_l[:, 5] = 0
+            else:
+                sig_tr_l_t[2, 2] = sig_33_new
+                if tau > 0:
+                    factor = tau_new / tau
+                    sig_tr_l_t[0, 2] *= factor
+                    sig_tr_l_t[1, 2] *= factor
+
+                n_vec, m_vec = np.zeros(6), np.zeros(6)
+                n_vec[2], m_vec[2] = tan_phi, tan_psi
+                if tau > 0:
+                    n_vec[4] = m_vec[4] = s23 / tau
+                    n_vec[5] = m_vec[5] = s13 / tau
+
+                D_m = self.D_eq_local @ m_vec
+                n_D = n_vec @ self.D_eq_local
+                denom = np.dot(n_vec, D_m)
+
+                if abs(denom) > 1e-12:
+                    D_ep = self.D_eq_local - np.outer(D_m, n_D) / denom
+                    if tau > 0:
+                        beta = tau_new / tau
+                        delta_D = np.zeros((6, 6))
+                        delta_D[4, 4] = self.alpha_2 * (1 - (s23 / tau) ** 2)
+                        delta_D[5, 5] = self.alpha_2 * (1 - (s13 / tau) ** 2)
+                        delta_D[4, 5] = delta_D[5, 4] = -self.alpha_2 * (s23 / tau) * (s13 / tau)
+                        D_tan_l = D_ep - (1 - beta) * delta_D
+                    else:
+                        D_tan_l = D_ep
+
+        st_g = self.R @ sig_tr_l_t @ self.R.T
+        self.stress = np.array([st_g[0, 0], st_g[1, 1], st_g[2, 2], st_g[0, 1], st_g[1, 2], st_g[0, 2]])
+
+        return self.stress, self._rotate_matrix(D_tan_l, self.R)
+
+    def get_tangent_matrix(self):
+        return self.D_eq_global if self.is_locked else self.D_rock
 
     def get_stress(self, strain):
         return self.stress
@@ -1576,17 +2070,16 @@ class NonLinearNewtonRaphsonControl(Control):
 File: .\FEM\Structure_Level\VTKExporter.py
 ====================
 
-# ====================================
-# File: .\FEM\Structure_Level\VTKExporter.py
-# ====================================
 import os
+import numpy as np
+import pyvista as pv
 
 
 class VTKExporter:
-    """Класс для экспорта результатов МКЭ в формат Legacy VTK (.vtk)"""
+    """Класс для экспорта результатов МКЭ в формат VTK через PyVista"""
 
     @staticmethod
-    def export(model, filename="results.vtk"):
+    def export(model, filename="results.vtu"):  # Рекомендуется использовать .vtu
         print(f"Экспорт результатов в {filename}...")
 
         num_nodes = len(model.nodes)
@@ -1596,79 +2089,72 @@ class VTKExporter:
             print("Ошибка: Модель пуста. Экспорт отменен.")
             return
 
-        # Создаем словарь для маппинга ID узлов в последовательные индексы (0, 1, 2...)
-        # VTK требует строгую нумерацию с нуля.
+        # 1. Маппинг узлов
         node_to_index = {node.id: idx for idx, node in enumerate(model.nodes)}
 
-        with open(filename, "w", encoding="utf-8") as f:
-            # 1. Заголовок VTK файла
-            f.write("# vtk DataFile Version 3.0\n")
-            f.write("FEM 3D Results\n")
-            f.write("ASCII\n")
-            f.write("DATASET UNSTRUCTURED_GRID\n\n")
+        # 2. Подготовка координат узлов (Points)
+        # Создаем numpy массив (N, 3), заполненный нулями
+        points = np.zeros((num_nodes, 3))
+        for idx, node in enumerate(model.nodes):
+            coords = node.coords
+            points[idx, 0] = coords[0] if len(coords) > 0 else 0.0
+            points[idx, 1] = coords[1] if len(coords) > 1 else 0.0
+            points[idx, 2] = coords[2] if len(coords) > 2 else 0.0
 
-            # 2. Запись координат узлов (POINTS)
-            f.write(f"POINTS {num_nodes} float\n")
-            for node in model.nodes:
-                coords = node.coords
-                # VTK всегда ожидает 3 координаты (X, Y, Z)
-                x = coords[0] if len(coords) > 0 else 0.0
-                y = coords[1] if len(coords) > 1 else 0.0
-                z = coords[2] if len(coords) > 2 else 0.0
-                f.write(f"{x:.6f} {y:.6f} {z:.6f}\n")
+        # 3. Подготовка топологии ячеек (Cells) и их типов
+        cells = []
+        cell_types = []
 
-            # 3. Запись топологии элементов (CELLS)
-            # Формат: <кол-во узлов в элементе> <индекс_узла_1> ... <индекс_узла_N>
-            # Считаем общий размер списка ячеек: (кол-во узлов + 1) для каждого элемента
-            total_list_size = sum(len(el.nodes) + 1 for el in model.elements)
-            f.write(f"\nCELLS {num_elements} {total_list_size}\n")
+        for el in model.elements:
+            n_nodes = len(el.nodes)
+            indices = [node_to_index[node.id] for node in el.nodes]
 
-            for el in model.elements:
-                n_nodes = len(el.nodes)
-                # Получаем последовательные индексы узлов
-                indices = [str(node_to_index[node.id]) for node in el.nodes]
-                f.write(f"{n_nodes} " + " ".join(indices) + "\n")
+            # Формат PyVista для cells: [количество_узлов, индекс_1, индекс_2, ...]
+            cells.append(n_nodes)
+            cells.extend(indices)
 
-            # 4. Запись типов элементов (CELL_TYPES)
-            f.write(f"\nCELL_TYPES {num_elements}\n")
-            for el in model.elements:
-                n_nodes = len(el.nodes)
-                # 12 = VTK_HEXAHEDRON (8 узлов)
-                # 9  = VTK_QUAD (4 узла)
-                if n_nodes == 8:
-                    vtk_type = 12
-                elif n_nodes == 4:
-                    vtk_type = 9
-                else:
-                    vtk_type = 1  # Неизвестный тип (Vertex)
-                f.write(f"{vtk_type}\n")
+            # Определение типа элемента согласно вашей логике
+            if n_nodes == 8:
+                cell_types.append(pv.CellType.HEXAHEDRON)  # Эквивалент 12
+            elif n_nodes == 4:
+                # В вашем коде 4 узла = тип 9 (VTK_QUAD).
+                # Если это 3D-тетраэдр, лучше использовать pv.CellType.TETRA (тип 10)
+                cell_types.append(pv.CellType.QUAD)
+            else:
+                cell_types.append(pv.CellType.VERTEX)  # Эквивалент 1
 
-            # 5. Запись узловых результатов (POINT_DATA)
-            f.write(f"\nPOINT_DATA {num_nodes}\n")
+        # Преобразуем списки в numpy массивы для скорости
+        cells = np.array(cells)
+        cell_types = np.array(cell_types)
 
-            # Векторное поле: Перемещения
-            f.write("VECTORS Displacements float\n")
-            for node in model.nodes:
-                disp = node.displacements
-                u = disp[0] if len(disp) > 0 else 0.0
-                v = disp[1] if len(disp) > 1 else 0.0
-                w = disp[2] if len(disp) > 2 else 0.0
-                f.write(f"{u:.6e} {v:.6e} {w:.6e}\n")
+        # 4. Создание объекта UnstructuredGrid
+        grid = pv.UnstructuredGrid(cells, cell_types, points)
 
-            # 6. Запись данных элементов (CELL_DATA)
-            f.write(f"\nCELL_DATA {num_elements}\n")
+        # 5. Добавление узловых результатов (Point Data - Перемещения)
+        displacements = np.zeros((num_nodes, 3))
+        for idx, node in enumerate(model.nodes):
+            disp = node.displacements
+            displacements[idx, 0] = disp[0] if len(disp) > 0 else 0.0
+            displacements[idx, 1] = disp[1] if len(disp) > 1 else 0.0
+            displacements[idx, 2] = disp[2] if len(disp) > 2 else 0.0
 
-            # Векторное поле: Нормаль трещины (Joint Normal)
-            f.write("VECTORS JointNormal float\n")
-            for el in model.elements:
-                nx, ny, nz = 0.0, 0.0, 0.0
-                # Пытаемся извлечь нормаль из первой точки интегрирования элемента
-                if len(el.integration_points) > 0:
-                    c_model = el.integration_points[0].constitutive_model
-                    # Проверяем, есть ли у модели материал и есть ли у материала нормаль
-                    if hasattr(c_model, 'mat') and hasattr(c_model.mat, 'normal'):
-                        nx, ny, nz = c_model.mat.normal
-                f.write(f"{nx:.6f} {ny:.6f} {nz:.6f}\n")
+        # Записываем данные в сетку (одной строкой!)
+        grid.point_data["Displacements"] = displacements
+
+        # 6. Добавление данных элементов (Cell Data - Нормали)
+        normals = np.zeros((num_elements, 3))
+        for idx, el in enumerate(model.elements):
+            if len(el.integration_points) > 0:
+                c_model = el.integration_points[0].constitutive_model
+                if hasattr(c_model, 'is_locked') and c_model.is_locked:
+                    if c_model.fixed_normal is not None:
+                        normals[idx] = c_model.fixed_normal
+
+        grid.cell_data["JointNormal"] = normals
+
+        # 7. Сохранение файла
+        # PyVista сама определит нужный формат записи (.vtu или .vtk) по расширению
+        grid.save(filename)
 
         print("Готово!")
 

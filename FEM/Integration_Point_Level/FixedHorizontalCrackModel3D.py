@@ -1,23 +1,20 @@
 import numpy as np
 
-# Импортируем модули для поиска критической плоскости и вычисления параметров
+# Импортируем модули для поиска критической плоскости
 from FEM.Integration_Point_Level.CriticalPlane.criterion import (
     find_critical_plane_shear,
-    find_critical_plane_tensile,
-    get_tensile_limit,
-    get_compression_limit,
-    get_cohesion_limit
+    find_critical_plane_tensile
 )
 from FEM.Integration_Point_Level.CriticalPlane.tensor import StressTensor
 from FEM.Abstract.Integration_Point_Level import ConstitutiveModel
 
 
-class UbiquitousJointModel3D(ConstitutiveModel):
+class FixedHorizontalCrackModel3D(ConstitutiveModel):
     """
-    Адаптивная модель сплошной среды с фиксацией трещины (Fixed Smeared Crack).
-    - До разрушения: Изотропная упругая порода.
-    - При разрушении: Ищет критическую плоскость, фиксирует её и вычисляет C, T и C_c для этой плоскости (через методы criterion).
-    - После разрушения: Строгая модель Ubiquitous Joint с согласованной матрицей и отсечками (Tension/Compression).
+    Модель с фиксированной горизонтальной трещиной.
+    - До разрушения: Изотропная упругая порода (высокая жесткость).
+    - При разрушении: Игнорирует реальный угол и принудительно фиксирует плоскость (0, 0, 1).
+    - После разрушения: Строгая модель Ubiquitous Joint с согласованной матрицей и сниженной жесткостью.
     """
 
     def __init__(self, material):
@@ -27,22 +24,22 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         nu = self.material.nu
         jp = self.material.joint_params
 
-        # --- 1. Параметры трещины ---
+        # --- 1. Параметры трещины (включаются ПОСЛЕ фиксации) ---
         self.kn, self.ks, self.kt, self.S = jp['kn'], jp['ks'], jp['kt'], jp['spacing']
+        self.c = jp.get('c', 0.0)
         self.phi = np.radians(jp.get('phi', 0.0))
         self.psi = np.radians(jp.get('psi', 0.0))
+        self.t_limit = jp.get('t', 0.0)
 
-        # Пределы прочности и сцепление теперь инициализируются нулями.
-        # Они будут вычислены строго по Critical Plane в момент образования трещины.
-        self.t_limit_base = 0.0
-        self.t_limit = 0.0
-        self.c_limit = 0.0
-        self.c = 0.0
+        # Ограничение на растяжение (Apex correction)
+        if self.phi > 0:
+            t_max = self.c / np.tan(self.phi)
+            self.t_limit = min(self.t_limit, t_max)
 
         # --- 2. Параметры поиска (Critical Plane Material) ---
         self.cp_material = jp.get('cp_material', None)
         if self.cp_material is None:
-            raise ValueError("Для адаптивной модели необходимо передать 'cp_material' в joint_params!")
+            raise ValueError("Для модели необходимо передать 'cp_material' в joint_params!")
 
         # --- 3. Упругая матрица целой породы (действует ДО фиксации) ---
         self.C_rock = self._build_isotropic_compliance(E, nu)
@@ -50,7 +47,7 @@ class UbiquitousJointModel3D(ConstitutiveModel):
 
         # --- 4. Переменные состояния фиксации ---
         self.is_locked = False
-        self.fixed_normal = None
+        self.fixed_normal = np.array([0.0, 0.0, 1.0]) # Площадка всегда фиксирована как горизонтальная
 
         # Заглушки для матриц, которые будут построены при фиксации
         self.R = np.eye(3)
@@ -81,9 +78,7 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         return C
 
     def _build_rotation_matrix(self, n):
-        nz = np.array(n, dtype=float).flatten()
-        nz /= np.linalg.norm(nz)
-
+        nz = np.array(n) / np.linalg.norm(n)
         if abs(nz[2]) > 0.999:
             nx = np.array([1.0, 0.0, 0.0])
             ny = np.cross(nz, nx)
@@ -91,11 +86,11 @@ class UbiquitousJointModel3D(ConstitutiveModel):
             ny = np.cross(nz, [0.0, 0.0, 1.0])
             ny /= np.linalg.norm(ny)
             nx = np.cross(ny, nz)
-
         nx /= np.linalg.norm(nx)
         return np.column_stack((nx, ny, nz))
 
     def _rotate_matrix(self, D, R):
+        """Вращение матрицы жесткости 6x6"""
         D_glob = np.zeros((6, 6))
         for j in range(6):
             e_g = np.zeros(6)
@@ -112,28 +107,12 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         return D_glob
 
     def _voigt_to_stresstensor(self, v):
+        """Конвертация вектора Фойгта в объект StressTensor"""
         return StressTensor(v[0], v[1], v[2], v[3], v[4], v[5])
 
-    def _lock_plane(self, normal, stress_tensor):
-        """Процедура фиксации трещины, вычисления C, T, C_c и перестроения матриц жесткости"""
-
-        self.fixed_normal = normal
+    def _lock_plane(self, normal):
+        """Процедура фиксации заданой трещины и перестроения матриц жесткости"""
         self.R = self._build_rotation_matrix(normal)
-
-        # ==========================================================
-        # ДИНАМИЧЕСКИЙ РАСЧЕТ ПАРАМЕТРОВ ПРОЧНОСТИ (C, T, C_c)
-        # ==========================================================
-        # Используем внешние функции из criterion.py
-        self.t_limit_base = get_tensile_limit(normal, self.cp_material)
-        self.c_limit = get_compression_limit(normal, self.cp_material)
-        self.c = get_cohesion_limit(normal, stress_tensor, self.cp_material)
-
-        # Пересчитываем ограничение на растяжение (Apex correction)
-        self.t_limit = self.t_limit_base
-        if self.phi > 0:
-            t_max = self.c / np.tan(self.phi)
-            self.t_limit = min(self.t_limit, t_max)
-        # ==========================================================
 
         # Добавляем податливость трещины к породе
         C_joint_local = self._build_joint_compliance(self.kn, self.ks, self.kt, self.S)
@@ -148,37 +127,41 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         self.D_eq_global = self._rotate_matrix(self.D_eq_local, self.R)
         self.is_locked = True
 
-        print(f" [!] ОБРАЗОВАНИЕ ТРЕЩИНЫ. Нормаль: [{normal[0]:.3f}, {normal[1]:.3f}, {normal[2]:.3f}]")
-        print(f"     => Сцепление: {self.c/1e6:.2f} МПа | Отрыв: {self.t_limit/1e6:.2f} МПа | Сжатие: {self.c_limit/1e6:.2f} МПа")
+        print(f" [!] ОБРАЗОВАНИЕ ТРЕЩИНЫ. Принудительно зафиксирована горизонтальная нормаль: [{normal[0]:.3f}, {normal[1]:.3f}, {normal[2]:.3f}]")
 
     def update_state(self, current_strain):
         self.strain = current_strain
         d_strain = current_strain - self.strain_old
 
         # ==========================================================
-        # ЭТАП 1: ПОИСК И ФИКСАЦИЯ (Если трещина еще не образовалась)
+        # ЭТАП 1: ДО РАЗРУШЕНИЯ (Упругая порода)
         # ==========================================================
         if not self.is_locked:
+            # Считаем пробное напряжение как для целой породы (Высокая жесткость)
             stress_trial_rock = self.stress_old + self.D_rock @ d_strain
             st = self._voigt_to_stresstensor(stress_trial_rock)
 
+            # Ищем, разрушилась ли порода в принципе (по свойствам целой породы)
             f_sh, n_sh, util_sh = find_critical_plane_shear(st, self.cp_material, mode='3D')
             f_t, n_t, util_t = find_critical_plane_tensile(st, self.cp_material, mode='3D')
 
             max_f = max(f_sh, f_t)
 
             if max_f > 0:
-                best_n = n_sh if f_sh > f_t else n_t
-                self._lock_plane(best_n, st)
+                # Порода не выдержала! ВМЕСТО найденной нормали жестко фиксируем (0,0,1)
+                self._lock_plane(self.fixed_normal)
             else:
+                # Порода держит нагрузку. Возвращаем упругое состояние.
                 self.stress = stress_trial_rock
                 return self.stress, self.D_rock
 
         # ==========================================================
-        # ЭТАП 2: РАБОТА С ЗАФИКСИРОВАННОЙ ТРЕЩИНОЙ (Return Mapping)
+        # ЭТАП 2: РАБОТА С ЗАФИКСИРОВАННОЙ ТРЕЩИНОЙ (Сниженная жесткость)
         # ==========================================================
+        # Считаем пробное напряжение уже с учетом податливости трещины (D_eq_global)
         sig_tr_v = self.stress_old + self.D_eq_global @ d_strain
 
+        # Перевод в локальные оси трещины
         st_t = np.array([[sig_tr_v[0], sig_tr_v[3], sig_tr_v[5]],
                          [sig_tr_v[3], sig_tr_v[1], sig_tr_v[4]],
                          [sig_tr_v[5], sig_tr_v[4], sig_tr_v[2]]])
@@ -187,32 +170,23 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         s33, s13, s23 = sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2]
         tau = np.sqrt(s13 ** 2 + s23 ** 2)
 
-        # Проверка критериев (Отрыв, Сдвиг, Сжатие)
+        # Проверка критериев (на уже зафиксированной площадке 0,0,1)
         f_s = tau + s33 * np.tan(self.phi) - self.c
         f_t = s33 - self.t_limit
-        f_c = -s33 - self.c_limit  # Критерий разрушения при сжатии (s33 отрицательно)
 
-        if f_s <= 0 and f_t <= 0 and f_c <= 0:
+        if f_s <= 0 and f_t <= 0:
             self.stress = sig_tr_v
             return self.stress, self.D_eq_global
 
+        # --- АЛГОРИТМИЧЕСКИЙ ВОЗВРАТ И СОГЛАСОВАННАЯ МАТРИЦА ---
         D_tan_l = self.D_eq_local.copy()
 
-        # --- АЛГОРИТМИЧЕСКИЙ ВОЗВРАТ ---
         if f_t > 0 or (f_s > 0 and (s33 + (f_s / self.alpha_2) * self.alpha_1 * np.tan(self.psi)) > self.t_limit):
-            # Отрыв (Tension Cutoff)
+            # Отрыв
             sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2] = self.t_limit, 0, 0
             D_tan_l[2, :] = 0; D_tan_l[:, 2] = 0
             D_tan_l[4, :] = 0; D_tan_l[:, 4] = 0
             D_tan_l[5, :] = 0; D_tan_l[:, 5] = 0
-
-        elif f_c > 0 or (f_s > 0 and (s33 - (f_s / self.alpha_2) * self.alpha_1 * np.tan(self.psi)) < -self.c_limit):
-            # Сжатие (Compression Cutoff) - разрушение породы
-            sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2] = -self.c_limit, 0, 0
-            D_tan_l[2, :] = 0; D_tan_l[:, 2] = 0
-            D_tan_l[4, :] = 0; D_tan_l[:, 4] = 0
-            D_tan_l[5, :] = 0; D_tan_l[:, 5] = 0
-
         else:
             # Сдвиг
             tan_phi, tan_psi = np.tan(self.phi), np.tan(self.psi)
@@ -224,21 +198,11 @@ class UbiquitousJointModel3D(ConstitutiveModel):
             apex_stress = self.c / tan_phi if self.phi > 0 else float('inf')
 
             if sig_33_new > apex_stress:
-                # Переход в отрыв из сдвига
                 sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2] = apex_stress, 0, 0
                 D_tan_l[2, :] = 0; D_tan_l[:, 2] = 0
                 D_tan_l[4, :] = 0; D_tan_l[:, 4] = 0
                 D_tan_l[5, :] = 0; D_tan_l[:, 5] = 0
-
-            elif sig_33_new < -self.c_limit:
-                # Переход в разрушение от сжатия из сдвига
-                sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2] = -self.c_limit, 0, 0
-                D_tan_l[2, :] = 0; D_tan_l[:, 2] = 0
-                D_tan_l[4, :] = 0; D_tan_l[:, 4] = 0
-                D_tan_l[5, :] = 0; D_tan_l[:, 5] = 0
-
             else:
-                # Чистый сдвиг
                 sig_tr_l_t[2, 2] = sig_33_new
                 if tau > 0:
                     factor = tau_new / tau
@@ -267,6 +231,7 @@ class UbiquitousJointModel3D(ConstitutiveModel):
                     else:
                         D_tan_l = D_ep
 
+        # Обратный перевод напряжений и касательной матрицы
         st_g = self.R @ sig_tr_l_t @ self.R.T
         self.stress = np.array([st_g[0, 0], st_g[1, 1], st_g[2, 2], st_g[0, 1], st_g[1, 2], st_g[0, 2]])
 
