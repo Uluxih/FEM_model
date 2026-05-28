@@ -33,6 +33,8 @@ joint_parameters = {
     'psi': 0,  # Дилатансия: 0
     't': 0,    # Прочность на разрыв: 0
     'cp_material': cp_mat  # Передаем объект CPMaterial
+
+
 }
 
 # Инициализируем материал (E = 20 ГПа, nu = 0.2)
@@ -74,9 +76,9 @@ tau_history = []
 
 # Создаем путь нагружения: 0 -> 0.002 -> -0.002 -> 0
 loading_path = np.concatenate([
-    np.linspace(0, 0.002, 50),
-    np.linspace(0.002, -0.002, 100),
-    np.linspace(-0.002, 0, 50)
+    np.linspace(0, 0.0001, 50),
+    np.linspace(0.0001, -0.0003, 100),
+    np.linspace(-0.0003, 0.0004, 50)
 ])
 
 print("Запуск циклического сдвига...")

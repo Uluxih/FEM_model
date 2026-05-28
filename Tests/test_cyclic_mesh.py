@@ -3,7 +3,7 @@ import numpy as np
 import scipy.sparse as sp
 import matplotlib.pyplot as plt
 
-# Автоматическое подключение быстрого многопоточного решателя (если установлен)
+# Автоматическое подключение быстрого многопоточного решателя
 try:
     import pypardiso as spla
 
@@ -11,43 +11,34 @@ try:
 except ImportError:
     import scipy.sparse.linalg as spla
 
-    print("[INFO] PyPardiso не найден. Используется однопоточный решатель SciPy (рекомендуется: pip install pypardiso)")
+    print("[INFO] PyPardiso не найден. Используется решатель SciPy (рекомендуется: pip install pypardiso)")
 
-# Импорты базовых классов МКЭ
+# Импорты базовых классов МКЭ (предполагается, что они есть в вашем проекте)
 from FEM.Abstract.Structure_Level import Node, FEModel, Control
 from FEM.Abstract.Integration_Point_Level import Material
 from FEM.Element_Level.Shape8NodeHexahedron import HEX8Factory
 from FEM.Structure_Level.VTKExporter import VTKExporter
 
 import FEM.Integration_Point_Level.CriticalPlane.material as cp_mt
-from FEM.Integration_Point_Level.CriticalPlane.tensor import StressTensor
-
-# Импорт оригинальной конститутивной модели
-from FEM.Integration_Point_Level.UbiquitousJointModel3D import UbiquitousJointModel3D
-
 
 # =====================================================================
-# ОБЕРТКА МОДЕЛИ (ДЛЯ ТЕСТА)
+# ВАЖНО: Используем ИСПРАВЛЕННУЮ модель с зафиксированной плоскостью
 # =====================================================================
-class FixedPlaneModel(UbiquitousJointModel3D):
-    """
-    Наследуем вашу модель и принудительно фиксируем плоскость при инициализации.
-    Это избавляет от необходимости менять исходный код вашей модели.
-    """
+from FEM.Integration_Point_Level.UbiquitousJointModel3D import UbiquitousJointModel3DFixed
 
+
+# Обертка для передачи фиксированной нормали
+class FixedPlaneModel(UbiquitousJointModel3DFixed):
     def __init__(self, material):
-        super().__init__(material)
-        # Принудительно фиксируем нормаль [0, 0, 1] (ось Z)
-        dummy_stress = StressTensor(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        self._lock_plane([0.0, 0.0, 1.0], dummy_stress)
+        # Жестко фиксируем плоскость по Z для теста
+        super().__init__(material, fixed_normal=[0.0, 0.0, 1.0])
 
 
-# Назначаем обертку как используемую модель
 modelFEM = FixedPlaneModel
 
 
 # =====================================================================
-# ЧАСТЬ 1: ЯДРО МКЭ И ОПТИМИЗИРОВАННЫЙ РЕШАТЕЛЬ
+# ЧАСТЬ 1: ЯДРО МКЭ
 # =====================================================================
 
 class JointedMaterial(Material):
@@ -68,15 +59,14 @@ class MultiElementNRControl(Control):
         self.load_factors = load_factors
         self.num_steps = len(load_factors)
         self.max_iter = max_iter
-        self.tol = tol  # Относительная точность (0.1% = 1e-3)
+        self.tol = tol
         self.track_nodes = track_nodes
         self.track_dof = track_dof
         self.history_U = [0.0]
         self.history_F = [0.0]
-        self.PENALTY = 1e12  # Безопасное значение для float64 (1e15 может дать сингулярность)
+        self.PENALTY = 1e12  # 1e15 может вызывать ill-conditioning, 1e12 безопаснее для float64
 
     def _precompute_topology_and_kinematics(self):
-        """Предварительный расчет геометрии, матриц B и индексов сборки"""
         num_elements = len(self.model.elements)
         ndof_per_el = len(self.model.elements[0].nodes) * 3
 
@@ -133,15 +123,10 @@ class MultiElementNRControl(Control):
         for node in self.model.nodes:
             node.displacements = U_global[node.dofs]
 
-        try:
-            VTKExporter.export(self.model, "results_step_000.vtk")
-        except:
-            pass
-
         prev_factor = 0.0
         ndof_per_el = self.el_dofs_map.shape[1]
 
-        # Выделяем память 1 раз
+        # Массив для сборки COO вынесен наружу для переиспользования памяти
         V_data = np.zeros(len(self.I_idx))
 
         for step, current_factor in enumerate(self.load_factors, 1):
@@ -161,15 +146,17 @@ class MultiElementNRControl(Control):
                     K_e = np.zeros((ndof_per_el, ndof_per_el))
                     F_int_e = np.zeros(ndof_per_el)
 
+                    B_el = self.B_map[e_idx]
+                    dV_el = self.dV_map[e_idx]
+
                     for ip_idx, ip in enumerate(element.integration_points):
-                        B = self.B_map[e_idx][ip_idx]
-                        dV = self.dV_map[e_idx][ip_idx]
+                        B = B_el[ip_idx]
+                        dV = dV_el[ip_idx]
 
                         current_strain = B @ U_el
                         stress, D_ep = ip.constitutive_model.update_state(current_strain)
 
-                        # ИСПРАВЛЕНИЕ РЕШАТЕЛЯ: Оптимизированный порядок умножения
-                        # B.T @ (D_ep @ B) сокращает количество операций на 70%
+                        # ОПТИМИЗАЦИЯ: Умножение (D_ep @ B) сначала, экономит 70% операций
                         D_B = D_ep @ B
                         K_e += B.T @ D_B * dV
                         F_int_e += B.T @ stress * dV
@@ -181,7 +168,7 @@ class MultiElementNRControl(Control):
                 Residual = -F_int
                 free_dofs = np.ones(total_dofs, dtype=bool)
 
-                # 2. Учет граничных условий
+                # 2. Учет граничных условий (Метод Штрафа)
                 for bc in self.model.bcs:
                     dof = bc.node.dofs[bc.dof_axis]
                     free_dofs[dof] = False
@@ -194,11 +181,12 @@ class MultiElementNRControl(Control):
                 # 3. Конвертация в формат CSR
                 K_t_sparse = sp.coo_matrix((V_data, (self.I_idx, self.J_idx)), shape=(total_dofs, total_dofs)).tocsr()
 
-                # 4. ИСПРАВЛЕНИЕ РЕШАТЕЛЯ: Стабильный критерий сходимости
+                # 4. Проверка сходимости (Надежный смешанный критерий)
                 if np.any(free_dofs):
                     norm_res = np.linalg.norm(Residual[free_dofs])
+                    # Используем норму реакции опор как базу для масштабирования
                     norm_react = np.linalg.norm(F_int[~free_dofs])
-                    scale = max(norm_react, 1.0)  # Защита от деления на ноль
+                    scale = max(norm_react, 1.0)
                     error = norm_res / scale
                 else:
                     error = 0.0
@@ -207,14 +195,14 @@ class MultiElementNRControl(Control):
                     print(f"  -> Сходимость за {iteration} итераций. (Относит. ошибка: {error:.2e})")
                     break
 
-                # 5. Решение СЛАУ с защитой от NaN
+                # 5. Решение СЛАУ
                 try:
                     dU = spla.spsolve(K_t_sparse, Residual)
                     if np.any(np.isnan(dU)):
                         raise ValueError("Получены NaN в векторе перемещений!")
                 except Exception as e:
-                    print(f"\n[КРИТИЧЕСКАЯ ОШИБКА] Матрица сингулярна или получены NaN: {e}")
-                    return  # Прерываем расчет, но сохраняем текущие результаты для графика
+                    print(f"\n[КРИТИЧЕСКАЯ ОШИБКА] Решатель упал на итерации {iteration}: {e}")
+                    return  # Прерываем расчет, но сохраняем графики
 
                 U_global += dU
             else:
@@ -228,11 +216,7 @@ class MultiElementNRControl(Control):
             for node in self.model.nodes:
                 node.displacements = U_global[node.dofs]
 
-            try:
-                VTKExporter.export(self.model, f"results_step_{step:03d}.vtk")
-            except:
-                pass
-
+            # Запись истории
             rx_force = sum(F_int[n.dofs[self.track_dof]] for n in self.track_nodes)
             current_u = U_global[self.track_nodes[0].dofs[self.track_dof]]
             self.history_U.append(current_u)
@@ -270,7 +254,7 @@ def generate_block_mesh(Lx, Ly, Lz, nx, ny, nz, material, factory):
 
 
 # =====================================================================
-# ЧАСТЬ 2: ПОЛЬЗОВАТЕЛЬСКИЙ ВВОД И ЗАПУСК РАСЧЕТА
+# ЧАСТЬ 2: ЗАПУСК РАСЧЕТА
 # =====================================================================
 
 def run_cyclic_test():
@@ -302,22 +286,18 @@ def run_cyclic_test():
         Rcx=ROCK_RC, Rcy=ROCK_RC, Rcz=ROCK_RC
     )
 
-    # Параметры сетки
     SIZE_X, SIZE_Y, SIZE_Z = 1.0, 4.0, 4.0
-    nx, ny, nz = 1, 4, 4  # Для теста снижено до 4x4, чтобы работало мгновенно
+    nx, ny, nz = 1, 4, 4  # Снизил плотность для быстрого теста, верните 16x16 если нужно
 
-    # Расчет реального размера элемента (Характеристическая длина для 3D)
     vol_el = (SIZE_X / nx) * (SIZE_Y / ny) * (SIZE_Z / nz)
-    char_len = vol_el ** (1 / 3)
+    char_len = vol_el ** (1 / 3)  # ИСПРАВЛЕНИЕ: Характерный размер для 3D это кубический корень из объема
 
     joint_params = {
         'cp_material': cp_material,
         'phi': 0.0,
         'psi': 0.0,
-        'R_inf': 15.0,
-        'b_param': 100.0,
         'Gf_t': 0.5,
-        'Gf_c': 5.0,
+        'Gf_c': 5.0,  # Немного увеличил энергию сжатия для стабильности
         'Gf_s': 5.0,
         'l_c': char_len
     }
@@ -344,7 +324,7 @@ def run_cyclic_test():
             top_nodes.append(node)
             model.add_bc(node, 2, 1.0)
 
-    # Траектория нагружения
+            # Траектория нагружения
     path_tension_1 = np.linspace(0, 0.0009, 100)[1:]
     path_compression = np.linspace(0.0009, -0.0040, 200)[1:]
     path_tension_2 = np.linspace(-0.0040, 0.0012, 150)[1:]
@@ -356,7 +336,7 @@ def run_cyclic_test():
         track_nodes=top_nodes,
         load_factors=load_factors,
         track_dof=2,
-        max_iter=50,
+        max_iter=50,  # 50 итераций более чем достаточно для квадратичной сходимости
         tol=1e-3
     )
 

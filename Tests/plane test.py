@@ -1,136 +1,121 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-# --- Импорты ваших реальных классов ---
-from FEM.Abstract.Integration_Point_Level import Material
+# Импорты из вашей архитектуры
+from FEM.Abstract.Structure_Level import FEModel, Node
+from FEM.Abstract.Integration_Point_Level import Material as BaseMaterial
+from FEM.Element_Level.Shape8NodeHexahedron import HEX8Factory
 from FEM.Integration_Point_Level.UbiquitousJointModel3D import UbiquitousJointModel3D
-import FEM.Integration_Point_Level.CriticalPlane.material as cp_mt
+from FEM.Integration_Point_Level.CriticalPlane.material import Material as CPMaterial
+from FEM.Structure_Level.NonLinearNewtonRaphsonControl import MultiElementNRControl
+from FEM.Structure_Level.VTKExporter import VTKExporter
 
 
-# 1. Обертка материала (в точности как в вашем основном коде)
-class JointedMaterial(Material):
-    """Обертка для передачи параметров в ConstitutiveModel"""
-
-    def __init__(self, E, nu, joint_params):
+# Вспомогательный класс для обхода абстрактности базового материала
+class SolidMaterial(BaseMaterial):
+    def __init__(self, E, nu):
         super().__init__(E, nu)
-        self.joint_params = joint_params
 
 
-def run_rigorous_ip_test():
-    print("=== ТЕСТ КОНСТИТУТИВНОЙ МОДЕЛИ НА 1 ТОЧКЕ ИНТЕГРИРОВАНИЯ ===")
+def run_test():
+    print("=== ПОДГОТОВКА ТЕСТА UBIQUITOUS JOINT MODEL ===")
 
-    # 2. Инициализация тензора (строгий парсинг)
-    tensor_data_str = """
-    0.001 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
-    0.000000 0.001 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
-    0.000000 0.000000 0.001 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
-    0.000000 0.000000 0.000000 0.001 0.000000 0.000000 0.000000 0.000000 0.000000
-    0.000000 0.000000 0.000000 0.000000 0.001 0.000000 0.000000 0.000000 0.000000
-    0.000000 0.000000 0.000000 0.000000 0.000000 0.001 0.000000 0.000000 0.000000
-    0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.001 0.000000 0.000000
-    0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.001 0.000000
-    0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.001
-    """
-    A_matrix = cp_mt.load_tensor_from_string(tensor_data_str)
-    A_matrix=A_matrix*100000000000000*2
-    # ВНИМАНИЕ: умножение на 1e18 убрано, так как оно ломает критерий разрушения.
-
-    # 3. Физико-механические свойства (приведены к реалистичным значениям для скалы)
-    ROCK_E = 01.50e7   # Модуль Юнга (Па)
-    ROCK_NU = 0.2     # Коэффициент Пуассона
-
-    # Прочность матрицы (для поиска критической плоскости)
-    ROCK_MU = 0.5     # Коэффициент трения матрицы (поиск)
-    ROCK_RP = 15.5e100   # Предел на растяжение (Па)
-    ROCK_RC = 15.0e100  # Предел на сжатие (Па)
-
-    cp_material = cp_mt.Material(
-        mu=ROCK_MU,
-        A_tensor=A_matrix,
-        Rpx=ROCK_RP, Rpy=ROCK_RP, Rpz=ROCK_RP,
-        Rcx=ROCK_RC, Rcy=ROCK_RC, Rcz=ROCK_RC
+    # 1. Настройка свойств материала
+    # 1.1 Материал для поиска критической плоскости (прочности)
+    # Задаем прочность на сжатие 20 МПа, растяжение 2 МПа
+    cp_mat = CPMaterial(
+        mu=0.5,
+        Rpx=2e6, Rpy=2e6, Rpz=2e6,
+        Rcx=20e6, Rcy=20e6, Rcz=20e6
     )
 
-    joint_params = {
-        'cp_material': cp_material,  # Передаем материал поиска
-
-        # Податливость (жесткость) образующейся трещины
-        'kn': 1,  # Нормальная жесткость (Па/м)
-        'ks': 1.5e100,  # Сдвиговая жесткость (Па/м)
-        'kt': 1.5e100,  # Сдвиговая жесткость (Па/м)
-        'spacing': 0.2,  # Расстояние между трещинами (м)
-
-        # Прочность скольжения по образовавшейся трещине
-        # ВНИМАНИЕ: Очень низкие значения приведут к резкому сбросу силы (хрупкое разрушение)
-        'c': 0.001*100000000*2,  # Сцепление трещины (Па)
-        'phi': 0.0,  # Угол внутреннего трения трещины (град)
-        'psi': 0.0,  # Угол дилатансии трещины (град)
-        't': 15.e10  # Прочность на отрыв по трещине (Па)
+    # 1.2 Основной FEM материал (Упругость + параметры трещины/разупрочнения)
+    mat = SolidMaterial(E=20e9, nu=0.2)  # E = 20 ГПа
+    mat.joint_params = {
+        'phi': 30.0,  # Угол внутреннего трения (градусы)
+        'psi': 10.0,  # Угол дилатансии (градусы)
+        'l_c': 1.0,  # Характеристическая длина элемента (для куба 1х1х1 равна 1)
+        'Gf_t': 100.0,  # Энергия разрушения при отрыве (Дж/м2)
+        'Gf_c': 5000.0,  # Энергия разрушения при сжатии (Дж/м2)
+        'Gf_s': 500.0,  # Энергия разрушения при сдвиге (Дж/м2)
+        'cp_material': cp_mat  # Передаем объект прочности
     }
 
-    global_material = JointedMaterial(E=ROCK_E, nu=ROCK_NU, joint_params=joint_params)
+    # 2. Создание геометрии (1 кубический элемент HEX8 1x1x1 метр)
+    model = FEModel()
 
-    # 4. Инициализация вашей конститутивной модели
-    model = UbiquitousJointModel3D(global_material)
+    # Порядок узлов важен для HEX8 (Нижняя грань против часовой, затем верхняя)
+    nodes = [
+        Node(0, [0.0, 0.0, 0.0]), Node(1, [1.0, 0.0, 0.0]),
+        Node(2, [1.0, 1.0, 0.0]), Node(3, [0.0, 1.0, 0.0]),
+        Node(4, [0.0, 0.0, 1.0]), Node(5, [1.0, 0.0, 1.0]),
+        Node(6, [1.0, 1.0, 1.0]), Node(7, [0.0, 1.0, 1.0])
+    ]
+    model.nodes.extend(nodes)
 
-    # 5. Настройка нагружения (Кинематическое нагружение - чистый сдвиг)
-    NUM_STEPS = 350
-    MAX_STRAIN = 0.08  # 0.4% деформации (достаточно для разрушения)
+    # 3. Сборка элемента через фабрику
+    factory = HEX8Factory()
+    # Обязательно передаем constitutive_class
+    elem = factory.create_element(nodes, mat, constitutive_class=UbiquitousJointModel3D)
+    model.elements.append(elem)
 
-    strains_history = []
-    stresses_history = []
+    # 4. Граничные условия
+    # 4.1 Жестко фиксируем нижнюю грань (Z=0) по всем осям
+    bottom_nodes = [nodes[0], nodes[1], nodes[2], nodes[3]]
+    for node in bottom_nodes:
+        model.add_bc(node, dof_axis=0, value=0.0)  # X
+        model.add_bc(node, dof_axis=1, value=0.0)  # Y
+        model.add_bc(node, dof_axis=2, value=0.0)  # Z
 
-    lock_strain = None
-    lock_stress = None
+    # 4.2 Задаем перемещение верхней грани (Z=1) вниз (Сжатие)
+    # Пиковая деформация примерно Rc/E = 20e6 / 20e9 = 0.001.
+    # Зададим -0.003 м, чтобы увидеть спад (softening).
+    target_displacement = -0.003
+    top_nodes = [nodes[4], nodes[5], nodes[6], nodes[7]]
+    for node in top_nodes:
+        # X и Y оставляем свободными (свободное поперечное расширение - эффект Пуассона)
+        model.add_bc(node, dof_axis=2, value=target_displacement)  # Z
 
-    print("Запуск шагов деформирования...")
-    for step in range(NUM_STEPS + 1):
-        # Постепенно увеличиваем сдвиговую деформацию gamma_xy
-        gamma_xy = (step / NUM_STEPS) * MAX_STRAIN
+    # 5. Настройка нелинейного решателя
+    # Разбиваем нагрузку (перемещение) на 60 шагов
+    load_factors = np.linspace(0.0, -0.050, 100)
 
-        # Вектор Фойгта: [eps_xx, eps_yy, eps_zz, gamma_xy, gamma_yz, gamma_xz]
-        current_strain = np.array([0.0, 0.0, 0.0, gamma_xy, 0.0, 0.0])
+    # Отслеживаем узлы верхней грани по оси Z (dof=2) для графика реакций
+    solver = MultiElementNRControl(
+        model=model,
+        track_nodes=top_nodes,
+        load_factors=load_factors,
+        track_dof=2,
+        max_iter=550,
+        tol=1e-4
+    )
 
-        # --- ЯДРО МКЭ ---
-        stress, D_tangent = model.update_state(current_strain)
-        model.commit()
-        # ----------------
+    # 6. Запуск расчета
+    solver.solve()
 
-        # Сохраняем данные (индекс 3 - это сдвиг в плоскости XY)
-        tau_xy = stress[3]
-        strains_history.append(gamma_xy)
-        stresses_history.append(tau_xy)
+    # 7. Постпроцессинг
+    # Экспорт в Paraview/PyVista
+    VTKExporter.export(model, "ubiquitous_compression_test.vtu")
 
-        # Отлавливаем момент фиксации трещины
-        if model.is_locked and lock_strain is None:
-            lock_strain = gamma_xy
-            lock_stress = tau_xy
-            print(f" [!] Сработал критерий разрушения на шаге {step}.")
-            print(f"     Деформация: {gamma_xy * 100:.3f}% | Напряжение: {tau_xy / 1e6:.2f} МПа")
+    # Построение графика Сила - Перемещение
+    # Переводим перемещения в мм, а силу в МегаНьютоны для красоты
+    U_history = np.array(solver.history_U) * 1000
+    F_history = np.array(solver.history_F) / 1e6
 
-    # 6. Построение графика
-    strains_percent = np.array(strains_history) * 100  # В проценты для красоты
-    stresses_mpa = np.array(stresses_history) / 1e6  # В мегапаскали
+    plt.figure(figsize=(8, 5))
+    plt.plot(U_history, F_history, marker='o', markersize=4, linestyle='-', color='b')
+    plt.title('Uniaxial Compression Test (Ubiquitous Joint Model 3D)')
+    plt.xlabel('Displacement Z (mm)')
+    plt.ylabel('Reaction Force Z (MN)')
+    plt.grid(True, linestyle='--', alpha=0.7)
 
-    plt.figure(figsize=(10, 6))
-    plt.plot(strains_percent, stresses_mpa, color='#1f77b4', linewidth=2.5, label=r'Касательное напряжение $\tau_{xy}$')
+    # Инвертируем оси, так как сжатие идет в минус
+    plt.gca().invert_xaxis()
+    plt.gca().invert_yaxis()
 
-    if lock_strain is not None:
-        plt.axvline(x=lock_strain * 100, color='red', linestyle='--', linewidth=1.5, label='Момент образования трещины')
-        plt.scatter([lock_strain * 100], [lock_stress / 1e6], color='red', s=60, zorder=5)
-
-    plt.title("Поведение материала в одной точке (UbiquitousJointModel3D)", fontsize=14, pad=15)
-    plt.xlabel(r"Сдвиговая деформация $\gamma_{xy}$ (%)", fontsize=12)
-    plt.ylabel(r"Напряжение сдвига $\tau_{xy}$ (МПа)", fontsize=12)
-    plt.grid(True, which='major', linestyle='-', alpha=0.5)
-    plt.grid(True, which='minor', linestyle=':', alpha=0.5)
-    plt.minorticks_on()
-    plt.legend(fontsize=11, loc='lower right')
     plt.tight_layout()
-
-    print("Расчет завершен. Отрисовка графика...")
     plt.show()
 
 
 if __name__ == "__main__":
-    run_rigorous_ip_test()
+    run_test()

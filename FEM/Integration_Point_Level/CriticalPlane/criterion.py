@@ -1,5 +1,4 @@
 import numpy as np
-from scipy.optimize import minimize, minimize_scalar
 import pytest
 from FEM.Integration_Point_Level.CriticalPlane.tensor import StressTensor
 import FEM.Integration_Point_Level.CriticalPlane.material as mt
@@ -31,35 +30,43 @@ def get_normal_vector(params, mode='3D'):
         raise ValueError(f"Неизвестный режим: {mode}")
 
 
-def global_maximize(objective_func, mode='3D'):
+# ==========================================
+# НОВЫЙ БЛОК: ГЕНЕРАЦИЯ ДИСКРЕТНЫХ ПЛОЩАДОК (ОПТИМИЗАЦИЯ)
+# ==========================================
+def generate_discrete_params(num_planes, mode='3D'):
     """
-    Глобальная оптимизация для 3D путём запуска локального поиска из нескольких стартовых точек.
+    Генерирует равномерно распределенный набор параметров (углов) для поиска.
+    Для 3D используется алгоритм сферы Фибоначчи для равномерного покрытия сферы.
+    Для 2D_XZ - равномерное распределение по полуокружности.
     """
-    if mode == '2D_XZ':
-        raise ValueError("global_maximize не предназначена для 2D режима")
+    params_list = []
+    if mode == '3D':
+        if num_planes == 1:
+            return [[0.0, 0.0]]
 
-    bounds = [(0, np.pi), (0, 2 * np.pi)]
-    best_res = None
-    best_f = -float('inf')
+        phi_golden = np.pi * (3.0 - np.sqrt(5.0))  # Золотой угол в радианах
+        for i in range(num_planes):
+            # y изменяется от 1 до -1
+            y = 1.0 - (i / float(num_planes - 1)) * 2.0
+            # Защита от ошибок округления для arccos
+            y = max(-1.0, min(1.0, y))
 
-    starting_points = [
-        [0, 0],  # Z
-        [np.pi / 2, 0],  # X
-        [np.pi / 2, np.pi / 2],  # Y
-        [np.pi / 4, np.pi / 4]  # диагональ
-    ]
+            theta = np.arccos(y)
+            phi = (i * phi_golden) % (2 * np.pi)
+            params_list.append([theta, phi])
 
-    for x0 in starting_points:
-        res = minimize(objective_func, x0, bounds=bounds, method='L-BFGS-B')
-        if -res.fun > best_f:
-            best_f = -res.fun
-            best_res = res
+    elif mode == '2D_XZ':
+        for i in range(num_planes):
+            theta = i * np.pi / num_planes
+            params_list.append([theta])
+    else:
+        raise ValueError(f"Неизвестный режим: {mode}")
 
-    return best_res.x, best_f
+    return params_list
 
 
 # ==========================================
-# НОВЫЙ БЛОК: ОТДЕЛЬНЫЕ ФУНКЦИИ ПРЕДЕЛОВ ПРОЧНОСТИ
+# БЛОК: ОТДЕЛЬНЫЕ ФУНКЦИИ ПРЕДЕЛОВ ПРОЧНОСТИ
 # ==========================================
 def get_tensile_limit(n, material: mt.Material):
     """Вычисляет предел прочности на растяжение на заданной площадке"""
@@ -110,18 +117,19 @@ def calculate_criterion_shear(params, stress_tensor, material: mt.Material, mode
     return f_val, n, tau_n, resistance
 
 
-def find_critical_plane_shear(stress_tensor, material, mode='3D'):
-    def objective(p):
+def find_critical_plane_shear(stress_tensor, material, mode='3D', num_planes=10):
+    best_params = None
+    max_f = -float('inf')
+
+    # Дискретный поиск по заданному количеству площадок
+    params_list = generate_discrete_params(num_planes, mode)
+    for p in params_list:
         f_val, _, _, _ = calculate_criterion_shear(p, stress_tensor, material, mode)
-        return -f_val
+        if f_val > max_f:
+            max_f = f_val
+            best_params = p
 
-    if mode == '2D_XZ':
-        res = minimize_scalar(objective, bounds=(0, np.pi), method='bounded')
-        best_params = [res.x]
-        max_f = -res.fun
-    else:
-        best_params, max_f = global_maximize(objective, mode)
-
+    # Полный расчет для наихудшей (критической) площадки
     _, best_n, tau_n, resistance = calculate_criterion_shear(best_params, stress_tensor, material, mode)
 
     if abs(resistance) < 1e-9:
@@ -146,19 +154,19 @@ def calculate_criterion_tensile(params, stress_tensor, material, mode='3D'):
     return f_val, n, sigma_n, Rp_n
 
 
-def find_critical_plane_tensile(stress_tensor, material, mode='3D'):
-    def objective(p):
-        f_val, _, _, _ = calculate_criterion_tensile(p, stress_tensor, material, mode='3D')
-        return -f_val
+def find_critical_plane_tensile(stress_tensor, material, mode='3D', num_planes=10):
+    best_params = None
+    max_f = -float('inf')
 
-    if mode == '2D_XZ':
-        res = minimize_scalar(objective, bounds=(0, np.pi), method='bounded')
-        best_params = [res.x]
-        max_f = -res.fun
-    else:
-        best_params, max_f = global_maximize(objective, mode)
+    # Дискретный поиск
+    params_list = generate_discrete_params(num_planes, mode)
+    for p in params_list:
+        f_val, _, _, _ = calculate_criterion_tensile(p, stress_tensor, material, mode)
+        if f_val > max_f:
+            max_f = f_val
+            best_params = p
 
-    _, best_n, sigma_n, Rp_n = calculate_criterion_tensile(best_params, stress_tensor, material, mode='3D')
+    _, best_n, sigma_n, Rp_n = calculate_criterion_tensile(best_params, stress_tensor, material, mode)
 
     if Rp_n < 1e-9:
         utilization = float('inf')
@@ -182,17 +190,17 @@ def calculate_criterion_compression(params, stress_tensor, material, mode='3D'):
     return f_val, n, sigma_n, Rc_n
 
 
-def find_critical_plane_compression(stress_tensor, material, mode='3D'):
-    def objective(p):
-        f_val, _, _, _ = calculate_criterion_compression(p, stress_tensor, material, mode)
-        return -f_val
+def find_critical_plane_compression(stress_tensor, material, mode='3D', num_planes=10):
+    best_params = None
+    max_f = -float('inf')
 
-    if mode == '2D_XZ':
-        res = minimize_scalar(objective, bounds=(0, np.pi), method='bounded')
-        best_params = [res.x]
-        max_f = -res.fun
-    else:
-        best_params, max_f = global_maximize(objective, mode)
+    # Дискретный поиск
+    params_list = generate_discrete_params(num_planes, mode)
+    for p in params_list:
+        f_val, _, _, _ = calculate_criterion_compression(p, stress_tensor, material, mode)
+        if f_val > max_f:
+            max_f = f_val
+            best_params = p
 
     _, best_n, sigma_n, Rc_n = calculate_criterion_compression(best_params, stress_tensor, material, mode)
 

@@ -1,172 +1,175 @@
 import numpy as np
 from FEM.Abstract.Structure_Level import Control
+import scipy.sparse.linalg as spla
+import scipy.sparse as sp
 
 
-class NonLinearNewtonRaphsonControl(Control):
-    """
-    Нелинейный решатель методом Ньютона-Рафсона (Newton-Raphson).
-    Поддерживает как силовое, так и кинематическое (заданные перемещения) нагружение.
-    """
-
-    def __init__(self, model, num_steps=10, tol=1e-4, max_iter=50):
+class MultiElementNRControl(Control):
+    def __init__(self, model, track_nodes, load_factors, track_dof=2, max_iter=300, tol=1e-3):
         super().__init__(model)
-        self.num_steps = num_steps
-        self.tol = tol
+        self.load_factors = load_factors
+        self.num_steps = len(load_factors)
         self.max_iter = max_iter
+        self.tol = tol
+        self.track_nodes = track_nodes
+        self.track_dof = track_dof
 
-    def solve(self):
-        print("Инициализация модели...")
-        self.model.initialize()
+        # ИСПРАВЛЕНО: Убраны стартовые нули, чтобы избежать дублирования точек на графике
+        self.history_U = []
+        self.history_F = []
 
+        self.PENALTY = 1e15
+        self.free_dofs = None
+
+    def _precompute_topology_and_kinematics(self):
+        num_elements = len(self.model.elements)
+        ndof_per_el = len(self.model.elements[0].nodes) * 3
         total_dofs = self.model.total_dofs
 
-        # Глобальный вектор полных перемещений делаем атрибутом класса
-        self.U_global = np.zeros(total_dofs)
+        self.el_dofs_map = np.zeros((num_elements, ndof_per_el), dtype=int)
+        self.B_map = []
+        self.dV_map = []
 
-        # Собираем базовый вектор внешних сил
-        F_ext_ref = np.zeros(total_dofs)
-        for load in self.model.nodal_loads:
-            F_ext_ref[load.node.dofs[load.dof_axis]] += load.value
+        num_k_entries = num_elements * (ndof_per_el ** 2) + len(self.model.bcs)
+        self.I_idx = np.zeros(num_k_entries, dtype=int)
+        self.J_idx = np.zeros(num_k_entries, dtype=int)
 
-        print(f"Начало нелинейного расчета: {self.num_steps} шагов.")
+        ptr = 0
+        for e_idx, element in enumerate(self.model.elements):
+            el_dofs = []
+            for node in element.nodes:
+                el_dofs.extend(node.dofs)
+            self.el_dofs_map[e_idx] = el_dofs
 
-        for step in range(1, self.num_steps + 1):
-            load_factor = step / self.num_steps
-            F_ext_current = F_ext_ref * load_factor
+            B_el, dV_el = [], []
+            node_coords = np.array([node.coords for node in element.nodes])
+            for ip in element.integration_points:
+                _, detJ = element.shape.get_jacobian(ip.coords, node_coords)
+                dN_dx = element.shape.get_shape_derivatives_cartesian(ip.coords, node_coords)
+                B = element.analysis_model.get_B_matrix(dN_dx)
+                h = element.analysis_model.get_h_coefficient()
+                dV = detJ * h * ip.weight
+                B_el.append(B)
+                dV_el.append(dV)
 
-            print(f"\n--- Шаг нагрузки {step}/{self.num_steps} (Load Factor = {load_factor:.2f}) ---")
+            self.B_map.append(B_el)
+            self.dV_map.append(dV_el)
+
+            grid = np.meshgrid(el_dofs, el_dofs, indexing='ij')
+            self.I_idx[ptr:ptr + ndof_per_el ** 2] = grid[0].ravel()
+            self.J_idx[ptr:ptr + ndof_per_el ** 2] = grid[1].ravel()
+            ptr += ndof_per_el ** 2
+
+        self.free_dofs = np.ones(total_dofs, dtype=bool)
+        for bc in self.model.bcs:
+            dof = bc.node.dofs[bc.dof_axis]
+            self.I_idx[ptr] = dof
+            self.J_idx[ptr] = dof
+            self.free_dofs[dof] = False
+            ptr += 1
+
+    def solve(self):
+        print("\nИнициализация модели и предрасчет кинематики...")
+        self.model.initialize()
+        self._precompute_topology_and_kinematics()
+
+        total_dofs = self.model.total_dofs
+        U_global = np.zeros(total_dofs)
+        V_data = np.zeros(len(self.I_idx))
+
+        prev_factor = 0.0
+        ndof_per_el = self.el_dofs_map.shape[1]
+
+        for step, current_factor in enumerate(self.load_factors, 1):
+            delta_factor = current_factor - prev_factor
+            print(f"\n=== Шаг нагрузки {step}/{self.num_steps} | Фактор: {current_factor:.5f} ===")
+
+            # ИСПРАВЛЕНО: Сборка вектора внешних сил (F_ext)
+            F_ext = np.zeros(total_dofs)
+            for load in self.model.nodal_loads:
+                dof = load.node.dofs[load.dof_axis]
+                F_ext[dof] += load.value * current_factor
+
+            # Базовая сила для этого шага (для избежания деления на 0 при расчете ошибки)
+            # ИСПРАВЛЕНО: Используем норму внешних сил, а не магическое число 1.0
+            norm_fext = np.linalg.norm(F_ext[self.free_dofs])
+            F_ref = norm_fext if norm_fext > 1e-12 else 1e-6
 
             for iteration in range(self.max_iter):
-                # 1. Сборка глобальной касательной матрицы жесткости и вектора внутренних сил
-                K_t = np.zeros((total_dofs, total_dofs))
+                V_data.fill(0.0)
                 F_int = np.zeros(total_dofs)
+                ptr = 0
 
-                for element in self.model.elements:
-                    el_dofs = []
-                    for node in element.nodes:
-                        el_dofs.extend(node.dofs)
+                # 1. Сборка матриц
+                for e_idx, element in enumerate(self.model.elements):
+                    el_dofs = self.el_dofs_map[e_idx]
+                    U_el = U_global[el_dofs]
 
-                    # Извлекаем текущие полные перемещения узлов элемента
-                    U_el = self.U_global[el_dofs]
+                    K_e = np.zeros((ndof_per_el, ndof_per_el))
+                    F_int_e = np.zeros(ndof_per_el)
 
-                    # Вычисляем матрицу и внутренние силы элемента
-                    K_e, F_int_e = self._compute_element_nonlinear(element, U_el)
+                    for ip_idx, ip in enumerate(element.integration_points):
+                        B = self.B_map[e_idx][ip_idx]
+                        dV = self.dV_map[e_idx][ip_idx]
 
-                    # Ассемблирование
-                    K_t[np.ix_(el_dofs, el_dofs)] += K_e
+                        current_strain = B @ U_el
+                        stress, D_ep = ip.constitutive_model.update_state(current_strain)
+
+                        K_e += B.T @ D_ep @ B * dV
+                        F_int_e += B.T @ stress * dV
+
+                    # ИСПРАВЛЕНО: Используем .ravel() вместо .flat для надежного присвоения
+                    V_data[ptr:ptr + ndof_per_el ** 2] = K_e.ravel()
+                    ptr += ndof_per_el ** 2
                     F_int[el_dofs] += F_int_e
 
-                # 2. Вычисление вектора невязки (Residual)
-                Residual = F_ext_current - F_int
+                # ИСПРАВЛЕНО: Невязка = Внешние силы - Внутренние силы
+                Residual = F_ext - F_int
 
-                # 3. Применение граничных условий
-                free_dofs = np.ones(total_dofs, dtype=bool)
-
-                # Сначала корректируем правую часть для свободных узлов
+                # 2. Граничные условия (Метод штрафов)
                 for bc in self.model.bcs:
                     dof = bc.node.dofs[bc.dof_axis]
-                    free_dofs[dof] = False  # Отмечаем, что этот DOF закреплен
+                    delta_u = (bc.value * delta_factor) if iteration == 0 else 0.0
+                    V_data[ptr] = self.PENALTY
+                    Residual[dof] = self.PENALTY * delta_u
+                    ptr += 1
 
-                    # Приращение заданного перемещения применяется ТОЛЬКО на 0-й итерации шага
-                    delta_u = (bc.value / self.num_steps) if iteration == 0 else 0.0
+                # 3. Сборка СЛАУ
+                K_t_sparse = sp.coo_matrix((V_data, (self.I_idx, self.J_idx)), shape=(total_dofs, total_dofs)).tocsr()
 
-                    if delta_u != 0.0:
-                        # Переносим влияние заданного перемещения на остальные узлы
-                        Residual -= K_t[:, dof] * delta_u
+                # 4. Проверка сходимости
+                norm_res = np.linalg.norm(Residual[self.free_dofs])
+                norm_fint = np.linalg.norm(F_int[self.free_dofs])
 
-                # Затем модифицируем матрицу и невязку для закрепленных узлов
-                for bc in self.model.bcs:
-                    dof = bc.node.dofs[bc.dof_axis]
-                    delta_u = (bc.value / self.num_steps) if iteration == 0 else 0.0
+                # Динамически обновляем F_ref, если внутренние силы стали больше внешних
+                F_ref = max(F_ref, norm_fint)
 
-                    K_t[dof, :] = 0.0
-                    K_t[:, dof] = 0.0
-                    K_t[dof, dof] = 1.0
-                    Residual[dof] = delta_u
+                error = norm_res / F_ref
 
-                # 4. Проверка сходимости (ТОЛЬКО по свободным степеням свободы)
-                free_dofs_indices = np.where(free_dofs)[0]
-                if len(free_dofs_indices) > 0:
-                    error = np.linalg.norm(Residual[free_dofs_indices])
-                    # Нормируем ошибку относительно текущей внешней нагрузки (если она есть)
-                    f_ext_norm = np.linalg.norm(F_ext_current[free_dofs_indices])
-                    if f_ext_norm > 1e-6:
-                        error_rel = error / f_ext_norm
-                    else:
-                        error_rel = error
-                else:
-                    error_rel = 0.0
-                    error = 0.0
-
-                print(f"  Итерация {iteration}: Невязка = {error:.6e} (Отн. = {error_rel:.6e})")
-
-                if np.isnan(error) or np.isinf(error):
-                    print("КРИТИЧЕСКАЯ ОШИБКА: Решение разошлось (NaN/Inf). Матрица стала сингулярной.")
-                    return
-
-                # Критерий выхода (сходимость)
-                if error_rel < self.tol and error < self.tol and iteration > 0:
-                    print(f"  Сходимость достигнута за {iteration} итераций!")
-
-                    # ОБНОВЛЕНО: Записываем перемещения в узлы сразу после сходимости шага
-                    for node in self.model.nodes:
-                        node.displacements = self.U_global[node.dofs]
-
-                    self._commit_state()
+                if error < self.tol and iteration > 0:
+                    print(f"  -> Сходимость за {iteration} итераций. (Относит. ошибка: {error:.2e})")
                     break
 
-                # 5. Решение системы уравнений K_t * dU = Residual
-                try:
-                    dU = np.linalg.solve(K_t, Residual)
-                except np.linalg.LinAlgError:
-                    print("ОШИБКА: Матрица жесткости вырождена (Singular matrix).")
-                    return
-
-                # 6. Обновление вектора перемещений
-                self.U_global += dU
-
+                # 5. Решение СЛАУ
+                dU = spla.spsolve(K_t_sparse, Residual)
+                U_global += dU
             else:
-                print("ВНИМАНИЕ: Сходимость не достигнута за максимальное число итераций!")
-                # Даже если не сошлись, фиксируем состояние, чтобы попытаться пройти дальше
-                for node in self.model.nodes:
-                    node.displacements = self.U_global[node.dofs]
-                self._commit_state()
+                print(f"  !!! ВНИМАНИЕ: Сходимость не достигнута за {self.max_iter} итераций !!! (Ошибка: {error:.2e})")
 
-        print("\nРасчет завершен!")
-
-    def _commit_state(self):
-        """Фиксирует историю деформаций во всех точках Гаусса после успешного шага"""
-        for element in self.model.elements:
-            for ip in element.integration_points:
-                if hasattr(ip.constitutive_model, 'commit'):
+            # 6. Фиксация состояния (Commit)
+            for element in self.model.elements:
+                for ip in element.integration_points:
                     ip.constitutive_model.commit()
 
-    def _compute_element_nonlinear(self, element, U_el):
-        """Вычисляет матрицу жесткости и вектор внутренних сил для одного элемента"""
-        ndof = len(U_el)
-        K_e = np.zeros((ndof, ndof))
-        F_int_e = np.zeros(ndof)
+            for node in self.model.nodes:
+                node.displacements = U_global[node.dofs]
 
-        node_coords = np.array([node.coords for node in element.nodes])
+            # Сохранение реакций
+            # Если track_nodes пустой, защищаем код от падения
+            if self.track_nodes:
+                rx_force = sum(F_int[n.dofs[self.track_dof]] for n in self.track_nodes)
+                current_u = U_global[self.track_nodes[0].dofs[self.track_dof]]
+                self.history_U.append(current_u)
+                self.history_F.append(rx_force)
 
-        for ip in element.integration_points:
-            # Геометрия
-            _, detJ = element.shape.get_jacobian(ip.coords, node_coords)
-            dN_dx = element.shape.get_shape_derivatives_cartesian(ip.coords, node_coords)
-
-            # Кинематика
-            B = element.analysis_model.get_B_matrix(dN_dx)
-            h = element.analysis_model.get_h_coefficient()
-            dV = detJ * h * ip.weight
-
-            # Вычисление полной деформации в точке Гаусса
-            current_strain = B @ U_el
-
-            # Запрос напряжений и касательной матрицы у модели материала
-            stress, D_ep = ip.constitutive_model.update_state(current_strain)
-
-            # Численное интегрирование
-            K_e += B.T @ D_ep @ B * dV
-            F_int_e += B.T @ stress * dV
-
-        return K_e, F_int_e
+            prev_factor = current_factor
