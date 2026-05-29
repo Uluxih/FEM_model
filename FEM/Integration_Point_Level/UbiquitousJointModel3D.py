@@ -37,6 +37,7 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         self.Gf_c = jp.get('Gf_c', 5000.0) / self.l_c
         self.Gf_s = jp.get('Gf_s', 500.0) / self.l_c
 
+
         # Модули упрочнения (в Damage-Plasticity для эффективных напряжений они равны нулю)
         self.H_t = 0.0
         self.H_c = 0.0
