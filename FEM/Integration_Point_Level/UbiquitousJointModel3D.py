@@ -233,30 +233,34 @@ class UbiquitousJointModel3D(ConstitutiveModel):
     # ============================ LOCKING ============================
 
     def _lock_plane(self, normal, stress_tensor):
-        print("locked", normal)
         self.fixed_normal = normal
         self.R = self._build_rotation_matrix(normal)
         self.T_sig, self.T_eps = self._build_voigt_transformation_matrices(self.R)
 
-        # D_local = T_sig @ D_rock @ T_sig.T
-        # Для изотропного D_rock результат совпадает с D_rock,
-        # но формула корректна и в анизотропном случае.
         self.D_local = self.T_sig @ self.D_rock @ self.T_sig.T
         self.E_n = self.D_local[2, 2]
-        self.G_s = self.D_local[4, 4]   # G (Войгт), НЕ делим на 2
+        self.G_s = self.D_local[4, 4]
 
-        # Прочностные пределы
-        self.f_t = max(get_tensile_limit(normal, self.cp_material),                    1e-12)
-        self.f_c = max(get_compression_limit(normal, self.cp_material),                1e-12)
-        self.c   = max(get_cohesion_limit(normal, stress_tensor, self.cp_material),    1e-12)
+        self.f_t = max(get_tensile_limit(normal, self.cp_material), 1e-12)
+        self.f_c = max(get_compression_limit(normal, self.cp_material), 1e-12)
+        self.c = max(get_cohesion_limit(normal, stress_tensor, self.cp_material), 1e-12)
 
-        # Модуль хардеинга H_t
-        denom  = (1.0 + self.f_t**2 / (3.0 * self.E_n * self.Gf_t)) * self.mu - 1.0
+        denom = (1.0 + self.f_t ** 2 / (3.0 * self.E_n * self.Gf_t)) * self.mu - 1.0
         self.H_t = abs(self.E_n / denom)
 
-        self.q_lim = self.c / self.tan_phi - self.f_t
+        # ИСПРАВЛЕНИЕ: Безопасное вычисление q_lim при phi = 0
+        if self.tan_phi < 1e-12:
+            self.q_lim = np.inf
+        else:
+            self.q_lim = self.c / self.tan_phi - self.f_t
+
         self.H_c = self.H_s = 0.0
         self.is_locked = True
+
+        # print(f"\n[LOCK DEBUG] Плоскость зафиксирована! Нормаль: {normal}")
+        # print(f"  Пределы: f_t={self.f_t:.2e}, f_c={self.f_c:.2e}, c={self.c:.2e}")
+        # print(f"  Жесткости: E_n={self.E_n:.2e}, G_s={self.G_s:.2e}, H_t={self.H_t:.2e}")
+        # print(f"  q_lim={self.q_lim:.2e}, tan_phi={self.tan_phi:.4f}")
 
     # ===================== ВСПОМОГАТЕЛЬНЫЕ =====================
 
@@ -272,24 +276,9 @@ class UbiquitousJointModel3D(ConstitutiveModel):
 
     # ===================== NEWTON-RAPHSON RETURN MAPPING =====================
 
+    # ===================== NEWTON-RAPHSON RETURN MAPPING =====================
+
     def _return_mapping_nr(self, sig_n_tr, tau_23_tr, tau_13_tr):
-        """
-        Newton–Raphson return mapping на критической плоскости (Minga 2017, Sec. 3.3).
-
-        Все компоненты — физические (Войгт: τ без множителей √2).
-
-        Поверхности текучести:
-          F1 :  σ_n − ft_curr(λ_t) = 0              растяжение, лин. хардеинг
-          F2 :  τ + σ_n·tan(φ) − c_curr = 0         Mohr-Coulomb (τ = ‖τ_23, τ_13‖)
-          F3 : −σ_n − fc = 0                         сжатие, идеально-пластичное
-
-        Правила течения (F2 — неассоциированное, дилатансия ψ):
-          dε_n^p  = dλ_t − dλ_c + dλ_s·tan(ψ)    нормальная деформация
-          dγ_23^p = dλ_s · τ_23/τ                  инженерная сдвиговая (γ = 2ε)
-          dγ_13^p = dλ_s · τ_13/τ                  инженерная сдвиговая (γ = 2ε)
-
-        Возвращает: (σ_n, τ_23, τ_13, dλ_t, dλ_c, dλ_s)
-        """
         tol      = self.nr_tol
         max_iter = self.nr_max_iter
 
@@ -303,16 +292,21 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         f_c_tr = -sig_n_tr - self.f_c
         f_s_tr = tau_tr + sig_n_tr * self.tan_phi - c_yld
 
-        tol_f = tol * max(self.f_t, self.f_c, self.c, 1.0)
+        # ИСПРАВЛЕНИЕ: Раздельные допуски для каждой поверхности!
+        # Это предотвращает баг, когда одно гигантское значение (например, f_c = 1.5e20)
+        # делает допуск настолько большим, что отключает вообще всю пластику.
+        tol_f_t = tol * max(self.f_t, 1.0)
+        tol_f_c = tol * max(self.f_c, 1.0)
+        tol_f_s = tol * max(self.c, 1.0)
 
         # Упругий шаг
-        if f_t_tr <= tol_f and f_c_tr <= tol_f and f_s_tr <= tol_f:
+        if f_t_tr <= tol_f_t and f_c_tr <= tol_f_c and f_s_tr <= tol_f_s:
             return sig_n_tr, tau_23_tr, tau_13_tr, 0.0, 0.0, 0.0
 
         # Предсказание активного набора
-        act_t = f_t_tr > tol_f and np.isfinite(ft_yld)
-        act_c = f_c_tr > tol_f and not act_t
-        act_s = f_s_tr > tol_f
+        act_t = f_t_tr > tol_f_t and np.isfinite(ft_yld)
+        act_c = f_c_tr > tol_f_c and not act_t
+        act_s = f_s_tr > tol_f_s
 
         def _nr_solve(act_t, act_c, act_s):
             col_t = 3                              if act_t else None
@@ -323,7 +317,7 @@ class UbiquitousJointModel3D(ConstitutiveModel):
             x = np.zeros(n)
             x[0], x[1], x[2] = sig_n_tr, tau_23_tr, tau_13_tr
 
-            for _ in range(max_iter):
+            for it in range(max_iter):
                 sig_n  = x[0];  tau_23 = x[1];  tau_13 = x[2]
                 d_lam_t = x[col_t] if act_t else 0.0
                 d_lam_c = x[col_c] if act_c else 0.0
@@ -337,8 +331,6 @@ class UbiquitousJointModel3D(ConstitutiveModel):
                 ft_curr = self._ft_curr(q_curr) if act_t else 0.0
                 c_curr  = self._c_curr(q_curr)
 
-                # ---- Вектор невязок ----
-                # Упругий предиктор: dσ_n = E_n·dε_n^p,  dτ = G_s·dγ^p
                 R_vec = np.zeros(n)
                 R_vec[0] = sig_n - sig_n_tr  + self.E_n * (d_lam_t - d_lam_c + d_lam_s * self.tan_psi)
                 R_vec[1] = tau_23 - tau_23_tr + self.G_s * d_lam_s * n23
@@ -351,10 +343,11 @@ class UbiquitousJointModel3D(ConstitutiveModel):
                 if act_s:
                     R_vec[row] = tau + sig_n * self.tan_phi - c_curr;      row += 1
 
-                if np.linalg.norm(R_vec) < tol:
+                # Нормализуем невязку по модулям упругости для корректной оценки сходимости
+                scale = max(self.E_n, self.G_s, 1.0)
+                if np.linalg.norm(R_vec) / scale < tol:
                     break
 
-                # ---- Якобиан ----
                 J = np.zeros((n, n))
                 J[0, 0] = 1.0
                 J[1, 1] = 1.0 + self.G_s * d_lam_s * n13**2 / tau_s
@@ -387,7 +380,10 @@ class UbiquitousJointModel3D(ConstitutiveModel):
                     row += 1
 
                 try:
-                    x -= np.linalg.solve(J, R_vec)
+                    dx = np.linalg.solve(J, R_vec)
+                    x -= dx
+                    if np.any(np.isnan(x)):
+                        break
                 except np.linalg.LinAlgError:
                     break
 
@@ -398,7 +394,6 @@ class UbiquitousJointModel3D(ConstitutiveModel):
 
         sig_n, tau_23, tau_13, d_lam_t, d_lam_c, d_lam_s = _nr_solve(act_t, act_c, act_s)
 
-        # Коррекция активного набора (corner return)
         if act_t and act_s:
             if d_lam_t < 0.0:
                 sig_n, tau_23, tau_13, d_lam_t, d_lam_c, d_lam_s = _nr_solve(False, False, True)
@@ -412,38 +407,28 @@ class UbiquitousJointModel3D(ConstitutiveModel):
 
         return sig_n, tau_23, tau_13, d_lam_t, d_lam_c, d_lam_s
 
+
     # ===================== ИНТЕГРАЦИЯ НАПРЯЖЕНИЙ =====================
 
     # ===================== ИНТЕГРАЦИЯ НАПРЯЖЕНИЙ =====================
 
     def _integrate_stress(self, current_strain, update_history=False):
-        """
-        Интегрирует напряжения в нотации Войгта.
-          Вход  : current_strain = [εxx, εyy, εzz, γxy, γyz, γxz]
-          Выход : [σxx, σyy, σzz, τxy, τyz, τxz]
-        """
         if not self.is_locked:
             return self.stress_old + self.D_rock @ (current_strain - self.strain_old)
 
-        # --- Переход в локальную СК ---
         e_l = self.T_eps @ current_strain
-
-        # Эффективные деформации (вычет пластических)
         e_l_eff = e_l.copy()
         e_l_eff[2] -= self.eps_p_n_old
         e_l_eff[4] -= self.gamma_p_23_old
         e_l_eff[5] -= self.gamma_p_13_old
 
-        # Пробные напряжения
         sig_l_tr = self.D_local @ e_l_eff
         sig_n_tr = sig_l_tr[2]
         tau_23_tr = sig_l_tr[4]
         tau_13_tr = sig_l_tr[5]
 
-        # =================== NEWTON-RAPHSON RETURN MAPPING ===================
         sig_n, tau_23, tau_13, d_lam_t, d_lam_c, d_lam_s = \
             self._return_mapping_nr(sig_n_tr, tau_23_tr, tau_13_tr)
-        # =====================================================================
 
         tau = np.sqrt(tau_23 ** 2 + tau_13 ** 2)
         d_eps_p_n = d_lam_t - d_lam_c + d_lam_s * self.tan_psi
@@ -451,7 +436,6 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         lam_t_new = self.lam_t_old + d_lam_t
         q_new = self.H_t * lam_t_new
 
-        # Пластические работы
         dW_t = max(sig_n * d_lam_t, 0.0) if d_lam_t > 0 else 0.0
         dW_c = max(abs(sig_n) * d_lam_c, 0.0) if d_lam_c > 0 else 0.0
         dW_s = max((tau + sig_n * self.tan_psi) * d_lam_s, 0.0) if d_lam_s > 0 else 0.0
@@ -468,26 +452,18 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         Fp_c = 0.5 * (np.sin(np.pi * r_c - 0.5 * np.pi) + 1.0)
         Fp_s = r_s * (2.0 - r_s)
 
-        # Параметры повреждения
         dt = Fp_t + self.a_t * Fp_s * (1.0 - Fp_t)
         D_nt_new = 1.0 - (1.0 - dt) * self.f_t / (self.f_t + q_new + 1e-12)
         D_nc_new = (1.0 - self.fcr_over_fc) * Fp_c
 
         ds_base = min(
-            max(
-                self.a_s * Fp_t * (1 - Fp_s) * (1 - Fp_c)
-                + Fp_s * Fp_c
-                + Fp_s * (1 - Fp_c)
-                + Fp_c * (1 - Fp_s),
-                0.0
-            ),
-            1.0
-        )
+            max(self.a_s * Fp_t * (1 - Fp_s) * (1 - Fp_c) + Fp_s * Fp_c + Fp_s * (1 - Fp_c) + Fp_c * (1 - Fp_s), 0.0),
+            1.0)
 
         if sig_n < 0.0:
             abs_sn = -sig_n
-            D_s_new = ds_base * (self.c + abs_sn * (self.tan_phi - self.tan_phi_r)) \
-                      / (self.c + abs_sn * self.tan_phi + 1e-12)
+            D_s_new = ds_base * (self.c + abs_sn * (self.tan_phi - self.tan_phi_r)) / (
+                        self.c + abs_sn * self.tan_phi + 1e-12)
         else:
             D_s_new = ds_base
 
@@ -495,22 +471,9 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         D_nc = min(max(D_nc_new, self.D_nc_old), 0.999)
         D_s = min(max(D_s_new, self.D_s_old), 0.999)
 
-        # --- ОТЛАДОЧНЫЙ ВЫВОД (только на основном шаге) ---
-        if update_history and (d_lam_s > 0 or self.D_s_old > 0):
-            print(f"\n[DEBUG] --- Шаг интеграции ---")
-            print(f"  sig_n = {sig_n:.2f}, tau = {tau:.2f}")
-            print(f"  d_lam_s = {d_lam_s:.4e}, dW_s = {dW_s:.4e}")
-            print(f"  W_pl_s_old = {self.W_pl_s_old:.4e}, W_pl_s = {W_pl_s:.4e}")
-            print(f"  Gf_s = {self.Gf_s:.2f}, r_s = {r_s:.4f}, Fp_s = {Fp_s:.4f}")
-            print(f"  Fp_t = {Fp_t:.4f}, Fp_c = {Fp_c:.4f}, ds_base = {ds_base:.4f}")
-            if sig_n < 0.0:
-                num = (self.c + abs_sn * (self.tan_phi - self.tan_phi_r))
-                den = (self.c + abs_sn * self.tan_phi + 1e-12)
-                print(f"  [Сжатие] num = {num:.2f}, den = {den:.2f}, D_s_new = {D_s_new:.4f}")
-            print(f"  D_s_old = {self.D_s_old:.4f}, Итоговый D_s = {D_s:.4f}")
-        # --------------------------------------------------a
+        # if update_history and (d_lam_s > 0 or self.D_s_old > 0):
+        #     print(f"[DAMAGE] dW_s={dW_s:.2e}, W_pl_s={W_pl_s:.2e}, r_s={r_s:.4f}, Fp_s={Fp_s:.4f}, D_s={D_s:.4f}")
 
-        # Сборка локальных напряжений
         sig_l = self.D_local @ e_l
         sig_l[2] = (1.0 - D_nt) * sig_n if sig_n >= 0.0 else (1.0 - D_nc) * sig_n
         sig_l[4] = (1.0 - D_s) * tau_23
@@ -565,6 +528,20 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         self.strain = current_strain
         self._reset_trial()
 
+        # # --- ВРЕМЕННЫЙ ХАК ДЛЯ ТЕСТА СДВИГА ---
+        # Принудительно задаем горизонтальную трещину, чтобы вектор сдвига
+        # идеально совпал с плоскостью повреждения.
+        if not self.is_locked:
+            sig_tr = self.stress_old + self.D_rock @ (current_strain - self.strain_old)
+            st = StressTensor(*sig_tr)
+            # Принудительно фиксируем горизонтальную плоскость (нормаль вдоль Z)
+            self._lock_plane(np.array([0.0, 0.0, 1.0]), st)
+        # -------------------------------------
+        # Интеграция
+        self.stress = self._integrate_stress(current_strain, update_history=True)
+
+
+
         if not self.is_locked:
             sig_tr = self.stress_old + self.D_rock @ (current_strain - self.strain_old)
             st = StressTensor(*sig_tr)
@@ -579,8 +556,8 @@ class UbiquitousJointModel3D(ConstitutiveModel):
                           n_sh if max_v == f_sh else
                           n_t)
                 self._lock_plane(best_n, st)
-                print(f"[LOCK] Стресс при锁定: {st}")
-                print(f"[LOCK] Когезия c = {self.c:.6f}")
+                # print(f"[LOCK] Стресс при锁定: {st}")
+                # print(f"[LOCK] Когезия c = {self.c:.6f}")
             else:
                 self.stress = sig_tr
                 self.D_tangent = self.D_rock.copy()
