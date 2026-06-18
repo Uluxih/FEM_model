@@ -508,7 +508,7 @@ class UbiquitousJointModel3D(ConstitutiveModel):
                 den = (self.c + abs_sn * self.tan_phi + 1e-12)
                 print(f"  [Сжатие] num = {num:.2f}, den = {den:.2f}, D_s_new = {D_s_new:.4f}")
             print(f"  D_s_old = {self.D_s_old:.4f}, Итоговый D_s = {D_s:.4f}")
-        # --------------------------------------------------
+        # --------------------------------------------------a
 
         # Сборка локальных напряжений
         sig_l = self.D_local @ e_l
