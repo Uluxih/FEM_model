@@ -5,7 +5,7 @@ import scipy.sparse as sp
 
 
 class MultiElementNRControl(Control):
-    def __init__(self, model, track_nodes, load_factors, track_dof=2, max_iter=300, tol=1e-3):
+    def __init__(self, model, track_nodes, load_factors, track_dof=2, max_iter=300, tol=1e-3, use_line_search=True):
         super().__init__(model)
         self.load_factors = load_factors
         self.num_steps = len(load_factors)
@@ -13,8 +13,8 @@ class MultiElementNRControl(Control):
         self.tol = tol
         self.track_nodes = track_nodes
         self.track_dof = track_dof
+        self.use_line_search = use_line_search
 
-        # ИСПРАВЛЕНО: Убраны стартовые нули, чтобы избежать дублирования точек на графике
         self.history_U = []
         self.history_F = []
 
@@ -68,6 +68,23 @@ class MultiElementNRControl(Control):
             self.free_dofs[dof] = False
             ptr += 1
 
+    def _compute_internal_forces(self, U_eval):
+        """Вспомогательный метод для Line Search: вычисляет только F_int без сборки K"""
+        F_int = np.zeros(self.model.total_dofs)
+        for e_idx, element in enumerate(self.model.elements):
+            el_dofs = self.el_dofs_map[e_idx]
+            U_el = U_eval[el_dofs]
+            F_int_e = np.zeros(len(el_dofs))
+            for ip_idx, ip in enumerate(element.integration_points):
+                B = self.B_map[e_idx][ip_idx]
+                dV = self.dV_map[e_idx][ip_idx]
+                current_strain = B @ U_el
+                # Вызываем update_state (он безопасен, пока не вызван commit())
+                stress, _ = ip.constitutive_model.update_state(current_strain)
+                F_int_e += B.T @ stress * dV
+            F_int[el_dofs] += F_int_e
+        return F_int
+
     def solve(self):
         print("\nИнициализация модели и предрасчет кинематики...")
         self.model.initialize()
@@ -84,14 +101,11 @@ class MultiElementNRControl(Control):
             delta_factor = current_factor - prev_factor
             print(f"\n=== Шаг нагрузки {step}/{self.num_steps} | Фактор: {current_factor:.5f} ===")
 
-            # ИСПРАВЛЕНО: Сборка вектора внешних сил (F_ext)
             F_ext = np.zeros(total_dofs)
             for load in self.model.nodal_loads:
                 dof = load.node.dofs[load.dof_axis]
                 F_ext[dof] += load.value * current_factor
 
-            # Базовая сила для этого шага (для избежания деления на 0 при расчете ошибки)
-            # ИСПРАВЛЕНО: Используем норму внешних сил, а не магическое число 1.0
             norm_fext = np.linalg.norm(F_ext[self.free_dofs])
             F_ref = norm_fext if norm_fext > 1e-12 else 1e-6
 
@@ -100,7 +114,7 @@ class MultiElementNRControl(Control):
                 F_int = np.zeros(total_dofs)
                 ptr = 0
 
-                # 1. Сборка матриц
+                # 1. Сборка матриц K и F_int
                 for e_idx, element in enumerate(self.model.elements):
                     el_dofs = self.el_dofs_map[e_idx]
                     U_el = U_global[el_dofs]
@@ -118,12 +132,10 @@ class MultiElementNRControl(Control):
                         K_e += B.T @ D_ep @ B * dV
                         F_int_e += B.T @ stress * dV
 
-                    # ИСПРАВЛЕНО: Используем .ravel() вместо .flat для надежного присвоения
                     V_data[ptr:ptr + ndof_per_el ** 2] = K_e.ravel()
                     ptr += ndof_per_el ** 2
                     F_int[el_dofs] += F_int_e
 
-                # ИСПРАВЛЕНО: Невязка = Внешние силы - Внутренние силы
                 Residual = F_ext - F_int
 
                 # 2. Граничные условия (Метод штрафов)
@@ -134,25 +146,85 @@ class MultiElementNRControl(Control):
                     Residual[dof] = self.PENALTY * delta_u
                     ptr += 1
 
-                # 3. Сборка СЛАУ
-                K_t_sparse = sp.coo_matrix((V_data, (self.I_idx, self.J_idx)), shape=(total_dofs, total_dofs)).tocsr()
-
-                # 4. Проверка сходимости
+                # 3. Проверка сходимости
                 norm_res = np.linalg.norm(Residual[self.free_dofs])
                 norm_fint = np.linalg.norm(F_int[self.free_dofs])
-
-                # Динамически обновляем F_ref, если внутренние силы стали больше внешних
                 F_ref = max(F_ref, norm_fint)
-
                 error = norm_res / F_ref
 
                 if error < self.tol and iteration > 0:
                     print(f"  -> Сходимость за {iteration} итераций. (Относит. ошибка: {error:.2e})")
                     break
 
-                # 5. Решение СЛАУ
-                dU = spla.spsolve(K_t_sparse, Residual)
-                U_global += dU
+                # 4. Сборка и решение СЛАУ с защитой от сингулярности
+                K_t_sparse = sp.coo_matrix((V_data, (self.I_idx, self.J_idx)), shape=(total_dofs, total_dofs)).tocsr()
+
+                try:
+                    import warnings
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", spla.MatrixRankWarning)
+                        dU = spla.spsolve(K_t_sparse, Residual)
+                except Exception as e:
+                    # Стабилизация матрицы при разупрочнении (Softening)
+                    diag = K_t_sparse.diagonal()
+                    valid_diag = diag[diag < self.PENALTY * 0.1]
+                    max_stiff = np.max(valid_diag) if len(valid_diag) > 0 else 1.0
+                    reg_matrix = sp.eye(total_dofs) * (max_stiff * 1e-4)
+                    dU = spla.spsolve(K_t_sparse + reg_matrix, Residual)
+
+                # ==========================================================
+                # 5. LINE SEARCH (Линейный поиск)
+                # ==========================================================
+                eta = 1.0
+
+                # Разделяем приращения на свободные и закрепленные узлы
+                dU_free = np.zeros_like(dU)
+                dU_free[self.free_dofs] = dU[self.free_dofs]
+
+                dU_fixed = np.zeros_like(dU)
+                dU_fixed[~self.free_dofs] = dU[~self.free_dofs]
+
+                if self.use_line_search and iteration > 0:
+                    # Проекция начальной невязки на направление поиска
+                    s0 = np.dot(dU_free, Residual)
+
+                    if abs(s0) > 1e-12:
+                        eta_prev = 0.0
+                        s_prev = s0
+                        ls_tol = 0.5  # Допуск линейного поиска (0.5 - стандарт для механики)
+
+                        for ls_iter in range(4):  # Максимум 4 итерации поиска
+                            # Пробный шаг (граничные условия dU_fixed применяются ВСЕГДА полностью!)
+                            U_ls = U_global + eta * dU_free + dU_fixed
+
+                            F_int_ls = self._compute_internal_forces(U_ls)
+                            R_ls = F_ext - F_int_ls
+
+                            s_eta = np.dot(dU_free, R_ls)
+
+                            # Условие сходимости линейного поиска
+                            if abs(s_eta) < ls_tol * abs(s0):
+                                if ls_iter > 0:
+                                    print(f"     [Line Search] Сошелся: eta = {eta:.3f} (iter {ls_iter})")
+                                break
+
+                            # Защита от деления на ноль
+                            if abs(s_eta - s_prev) < 1e-14:
+                                break
+
+                            # Обновление eta методом секущих
+                            d_eta = -s_eta * (eta - eta_prev) / (s_eta - s_prev)
+
+                            eta_prev = eta
+                            s_prev = s_eta
+                            eta = eta + d_eta
+
+                            # Ограничиваем скачки eta, чтобы не улететь слишком далеко
+                            eta = max(0.05, min(eta, 5.0))
+
+                # Обновляем глобальные перемещения с учетом найденного шага eta
+                U_global += (eta * dU_free) + dU_fixed
+
             else:
                 print(f"  !!! ВНИМАНИЕ: Сходимость не достигнута за {self.max_iter} итераций !!! (Ошибка: {error:.2e})")
 
@@ -164,8 +236,6 @@ class MultiElementNRControl(Control):
             for node in self.model.nodes:
                 node.displacements = U_global[node.dofs]
 
-            # Сохранение реакций
-            # Если track_nodes пустой, защищаем код от падения
             if self.track_nodes:
                 rx_force = sum(F_int[n.dofs[self.track_dof]] for n in self.track_nodes)
                 current_u = U_global[self.track_nodes[0].dofs[self.track_dof]]
