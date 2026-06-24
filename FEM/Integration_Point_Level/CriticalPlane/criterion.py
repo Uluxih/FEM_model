@@ -117,7 +117,7 @@ def calculate_criterion_shear(params, stress_tensor, material: mt.Material, mode
     return f_val, n, tau_n, resistance
 
 
-def find_critical_plane_shear(stress_tensor, material, mode='3D', num_planes=10):
+def find_critical_plane_shear(stress_tensor, material, mode='3D', num_planes=5):
     best_params = None
     max_f = -float('inf')
 
@@ -154,7 +154,7 @@ def calculate_criterion_tensile(params, stress_tensor, material, mode='3D'):
     return f_val, n, sigma_n, Rp_n
 
 
-def find_critical_plane_tensile(stress_tensor, material, mode='3D', num_planes=10):
+def find_critical_plane_tensile(stress_tensor, material, mode='3D', num_planes=5):
     best_params = None
     max_f = -float('inf')
 
@@ -190,7 +190,7 @@ def calculate_criterion_compression(params, stress_tensor, material, mode='3D'):
     return f_val, n, sigma_n, Rc_n
 
 
-def find_critical_plane_compression(stress_tensor, material, mode='3D', num_planes=10):
+def find_critical_plane_compression(stress_tensor, material, mode='3D', num_planes=5):
     best_params = None
     max_f = -float('inf')
 

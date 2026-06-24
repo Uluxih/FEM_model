@@ -315,6 +315,112 @@ class Control(ABC):
 
 
 ====================
+File: .\FEM\Element_Level\Shape4NodeQuadrilateral.py
+====================
+
+import numpy as np
+from FEM.Abstract.Element_Level import Shape, AnalysisModel, ElementFactory
+from FEM.Abstract.Integration_Point_Level import IntegrationPoint
+
+# Предполагается наличие 2D модели анализа по аналогии с Solid3DModel
+# Если класс называется иначе (например, PlaneStress2DModel), замените импорт и вызов фабрики
+from FEM.Element_Level.Solid2DModel import Solid2DModel
+
+
+class Shape4NodeQuadrilateral(Shape):
+    """Геометрия 4-узлового плоского изопараметрического элемента (QUAD4)"""
+
+    def __init__(self):
+        # Локальные координаты узлов в стандартном квадрате [-1, 1]
+        # Порядок обхода: против часовой стрелки, начиная с нижнего левого угла
+        # Узел 1: (-1, -1)
+        # Узел 2: ( 1, -1)
+        # Узел 3: ( 1,  1)
+        # Узел 4: (-1,  1)
+        self.xi_i = np.array([-1, 1, 1, -1])
+        self.eta_i = np.array([-1, -1, 1, 1])
+
+    def get_shape_functions(self, local_coords):
+        xi, eta = local_coords
+        # N_i = 1/4 * (1 + xi*xi_i) * (1 + eta*eta_i)
+        N = 0.25 * (1 + xi * self.xi_i) * (1 + eta * self.eta_i)
+        return N
+
+    def _get_local_derivatives(self, local_coords):
+        """Производные dN/dxi, dN/deta"""
+        xi, eta = local_coords
+        dN_dxi = 0.25 * self.xi_i * (1 + eta * self.eta_i)
+        dN_deta = 0.25 * self.eta_i * (1 + xi * self.xi_i)
+        return np.array([dN_dxi, dN_deta])  # Размерность (2, 4)
+
+    def get_jacobian(self, local_coords, node_coords):
+        local_derivs = self._get_local_derivatives(local_coords)
+        # Матрица Якоби: J = [dN/dxi, dN/deta] * [X, Y]
+        # node_coords имеет размерность (4, 2)
+        J = local_derivs @ node_coords  # (2, 4) @ (4, 2) -> (2, 2)
+        detJ = np.linalg.det(J)
+        return J, detJ
+
+    def get_shape_derivatives_cartesian(self, local_coords, node_coords):
+        local_derivs = self._get_local_derivatives(local_coords)
+        J, _ = self.get_jacobian(local_coords, node_coords)
+        J_inv = np.linalg.inv(J)
+
+        # [dN/dx, dN/dy]^T = J^-1 * [dN/dxi, dN/deta]^T
+        dN_dx = J_inv @ local_derivs  # (2, 2) @ (2, 4) -> (2, 4)
+        return dN_dx
+
+
+# ==========================================
+# ФАБРИКА ЭЛЕМЕНТОВ (FACTORY)
+# ==========================================
+class QUAD4Factory(ElementFactory):
+    """Фабрика для сборки 2D элементов QUAD4"""
+
+    def _get_shape(self) -> Shape:
+        return Shape4NodeQuadrilateral()
+
+    def _get_analysis_model(self, **kwargs) -> AnalysisModel:
+        # Укажите здесь вашу актуальную 2D модель (Solid2DModel, PlaneStress2DModel и т.д.)
+        return Solid2DModel()
+
+    def _create_integration_points(self, material, **kwargs) -> list:
+        """
+        Создает 4 точки интегрирования по правилу Гаусса (2x2).
+        Ожидает в kwargs параметр `constitutive_class` (класс физической модели).
+        """
+        # Правило Гаусса для 2 точек
+        g = 1.0 / np.sqrt(3.0)
+        gauss_coords = [-g, g]
+        gauss_weight = 1.0  # Вес каждой точки в 1D равен 1.0
+
+        # Получаем класс физической модели из аргументов
+        constitutive_class = kwargs.get('constitutive_class')
+        if constitutive_class is None:
+            raise ValueError("Для создания элемента необходимо передать 'constitutive_class' в kwargs")
+
+        integration_points = []
+
+        # Двойной цикл для 2D
+        for xi in gauss_coords:
+            for eta in gauss_coords:
+                # В 2D вес: W = w_xi * w_eta = 1.0 * 1.0 = 1.0
+                weight = gauss_weight * gauss_weight
+
+                # Создаем индивидуальный экземпляр модели материала для этой точки
+                c_model = constitutive_class(material)
+
+                ip = IntegrationPoint(
+                    coords=[xi, eta],
+                    weight=weight,
+                    constitutive_model=c_model
+                )
+                integration_points.append(ip)
+
+        return integration_points
+
+
+====================
 File: .\FEM\Element_Level\Shape8NodeHexahedron.py
 ====================
 
@@ -413,6 +519,65 @@ class HEX8Factory(ElementFactory):
         return integration_points
 
 ====================
+File: .\FEM\Element_Level\Solid2DModel.py
+====================
+
+import numpy as np
+from FEM.Abstract.Element_Level import Shape, AnalysisModel, ElementFactory
+from FEM.Abstract.Integration_Point_Level import IntegrationPoint
+# Для 2D обычно используется 4-узловой четырехугольник или 3-узловой треугольник
+# from FEM.Element_Level.Shape4NodeQuad import *
+
+class Solid2DModel(AnalysisModel):
+    """
+    Модель сплошной 2D среды (плоская деформация или плоское напряженное состояние).
+    3 компоненты деформации, 2 перемещения на узел.
+    """
+
+    def __init__(self, thickness=1.0):
+        """
+        Инициализация 2D модели.
+        :param thickness: Толщина элемента (t). Для плоской деформации обычно t=1.0.
+        """
+        # Если в базовом AnalysisModel есть __init__, вызываем его: super().__init__()
+        self.thickness = thickness
+
+    def get_B_matrix(self, shape_derivatives):
+        """
+        Собирает матрицу B (размер 3 x 2*num_nodes).
+        Порядок деформаций: [xx, yy, xy]
+        """
+        num_nodes = shape_derivatives.shape[1]  # Например, 4 для четырехугольника
+        B = np.zeros((3, num_nodes * 2))
+
+        for i in range(num_nodes):
+            dN_dx = shape_derivatives[0, i]
+            dN_dy = shape_derivatives[1, i]
+
+            # Индексы столбцов для текущего узла (u, v)
+            col_x = 2 * i
+            col_y = 2 * i + 1
+
+            # Нормальные деформации (xx, yy)
+            B[0, col_x] = dN_dx
+            B[1, col_y] = dN_dy
+
+            # Сдвиговая деформация (инженерная гамма xy)
+            # gamma_xy = du/dy + dv/dx
+            B[2, col_x] = dN_dy
+            B[2, col_y] = dN_dx
+
+        return B
+
+    def get_h_coefficient(self):
+        """
+        В 2D интегрирование идет по площади (dA = detJ * dxi * deta),
+        поэтому для получения интеграла по объему необходимо умножить на толщину (t).
+        """
+        return self.thickness
+
+
+====================
 File: .\FEM\Element_Level\Solid3DModel.py
 ====================
 
@@ -469,18 +634,58 @@ class Solid3DModel(AnalysisModel):
 
 
 ====================
+File: .\FEM\Element_Level\SpringElement2D.py
+====================
+
+import numpy as np
+from FEM.Abstract.Element_Level import Element
+
+class SpringElement2D(Element):
+    """
+    Специальный 2D пружинный элемент для стабилизации ниспадающей ветви (уравнение 71).
+    """
+
+    def __init__(self, nodes, kx, ky):
+        """
+        :param nodes: Список из ровно 2-х узлов [NodeA, NodeB]
+        :param kx: Жесткость вдоль оси X
+        :param ky: Жесткость вдоль оси Y
+        """
+        # Инициализируем базовый класс пустыми значениями для континуальной физики
+        super().__init__(nodes=nodes, shape=None, analysis_model=None, integration_points=[])
+        self.kx = kx
+        self.ky = ky
+        self.is_spring = True  # Флаг для быстрой идентификации в решателе
+
+    def compute_stiffness(self):
+        """
+        Аналитическая матрица жесткости K_spr (Размер 4x4 для 2D).
+        Порядок dof: [u1_x, u1_y, u2_x, u2_y]
+        """
+        K = np.array([
+            [ self.kx,  0.0,     -self.kx,  0.0    ],
+            [ 0.0,      self.ky,  0.0,     -self.ky],
+            [-self.kx,  0.0,      self.kx,  0.0    ],
+            [ 0.0,     -self.ky,  0.0,      self.ky]
+        ], dtype=float)
+        return K
+
+    def compute_internal_force(self, U_el):
+        """
+        Вектор внутренних сил элемента F_int = K_spr * U_el
+        """
+        K = self.compute_stiffness()
+        return K @ U_el
+
+
+====================
 File: .\FEM\Integration_Point_Level\ElasticModel3D.py
 ====================
 
 from FEM.Abstract.Integration_Point_Level import ConstitutiveModel
-from FEM.Abstract.Structure_Level import Node
 import numpy as np
-from FEM.Abstract.Element_Level import Shape, AnalysisModel, ElementFactory
-from FEM.Abstract.Integration_Point_Level import IntegrationPoint
-from FEM.Element_Level.Solid3DModel import *
 
-
-# 1. Простая 3D упругая модель для теста
+# 1. Простая 3D упругая модель
 class ElasticModel3D(ConstitutiveModel):
     def get_tangent_matrix(self):
         E = self.material.E
@@ -498,6 +703,22 @@ class ElasticModel3D(ConstitutiveModel):
     def get_stress(self, strain):
         return self.get_tangent_matrix() @ strain
 
+    # --- ДОБАВЛЕНО ДЛЯ СОВМЕСТИМОСТИ С НЕЛИНЕЙНЫМ РЕШАТЕЛЕМ ---
+    def update_state(self, current_strain):
+        """
+        Возвращает текущие напряжения и касательную матрицу жесткости.
+        Для линейной упругости D - константа, а stress = D * strain.
+        """
+        D_ep = self.get_tangent_matrix()
+        stress = D_ep @ current_strain
+        return stress, D_ep
+
+    def commit(self):
+        """
+        Фиксация внутренних переменных состояния.
+        Для упругости история не нужна, поэтому просто pass.
+        """
+        pass
 
 
 ====================
@@ -755,19 +976,500 @@ class FixedHorizontalCrackModel3D(ConstitutiveModel):
 
 
 ====================
-File: .\FEM\Integration_Point_Level\FixedHorizontalJointModel3D.py
+File: .\FEM\Integration_Point_Level\MultiUbiquitousJointModel2D.py
 ====================
 
 import numpy as np
+
+from FEM.Integration_Point_Level.CriticalPlane.criterion import (
+    find_critical_plane_shear,
+    find_critical_plane_tensile,
+    find_critical_plane_compression,
+    get_tensile_limit,
+    get_compression_limit,
+    get_cohesion_limit
+)
+from FEM.Integration_Point_Level.CriticalPlane.tensor import StressTensor
 from FEM.Abstract.Integration_Point_Level import ConstitutiveModel
 
 
-class FixedHorizontalJointModel3D(ConstitutiveModel):
+class PlaneState:
+    """Вспомогательный класс для хранения истории и свойств отдельной плоскости (трещины)"""
+
+    def __init__(self, normal, cp_material, D_rock, mu, l_c, Gf_t, Gf_c, Gf_s, a_t, a_s, fcr_over_fc, phi, psi, phi_r):
+        self.normal = np.array(normal)
+        self.nx, self.ny = self.normal[0], self.normal[1]
+
+        # Матрицы трансформации
+        self.T_sig, self.T_eps = self._build_2d_voigt_transformation(self.nx, self.ny)
+        self.T_eps_inv = np.linalg.inv(self.T_eps)
+
+        # Локальная жесткость
+        self.D_local = self.T_sig @ D_rock @ self.T_eps_inv
+        self.E_n = self.D_local[0, 0]
+        self.G_s = self.D_local[2, 2]
+
+        # Пределы прочности
+        self.f_t = max(get_tensile_limit(self.normal, cp_material), 1e-12)
+        self.f_c = max(get_compression_limit(self.normal, cp_material), 1e-12)
+        # Базовое сцепление (будет обновляться при необходимости, но здесь берем начальное)
+        # Для упрощения инициализации передаем фиктивный тензор, так как c обычно константа
+        st_dummy = StressTensor(0, 0, 0, 0, 0, 0)
+        self.c = max(get_cohesion_limit(self.normal, st_dummy, cp_material), 1e-12)
+
+        # Параметры разупрочнения
+        denom = (1.0 + self.f_t ** 2 / (3.0 * self.E_n * Gf_t)) * mu - 1.0
+        self.H_t = abs(self.E_n / denom) if denom != 0 else 0.0
+
+        self.tan_phi = np.tan(phi)
+        self.tan_psi = np.tan(psi)
+        self.tan_phi_r = np.tan(phi_r)
+
+        self.q_lim = (self.c / self.tan_phi - self.f_t) if self.tan_phi > 1e-12 else np.inf
+
+        # Параметры Damage
+        self.Gf_t, self.Gf_c, self.Gf_s = Gf_t, Gf_c, Gf_s
+        self.a_t, self.a_s = a_t, a_s
+        self.fcr_over_fc = fcr_over_fc
+
+        # Переменные состояния (Old)
+        self.lam_t_old = self.lam_c_old = self.lam_s_old = 0.0
+        self.W_pl_t_old = self.W_pl_c_old = self.W_pl_s_old = 0.0
+        self.D_nt_old = self.D_nc_old = self.D_s_old = 0.0
+
+        # Переменные состояния (Trial)
+        self.lam_t = self.lam_c = self.lam_s = 0.0
+        self.W_pl_t = self.W_pl_c = self.W_pl_s = 0.0
+        self.D_nt = self.D_nc = self.D_s = 0.0
+
+        # Текущие эффективные напряжения на плоскости (для Damage)
+        self.sig_n_eff = 0.0
+        self.tau_eff = 0.0
+
+    def _build_2d_voigt_transformation(self, nx, ny):
+        T_sig = np.zeros((3, 3))
+        T_sig[0, 0] = nx ** 2;
+        T_sig[0, 1] = ny ** 2;
+        T_sig[0, 2] = 2.0 * nx * ny
+        T_sig[1, 0] = ny ** 2;
+        T_sig[1, 1] = nx ** 2;
+        T_sig[1, 2] = -2.0 * nx * ny
+        T_sig[2, 0] = -nx * ny;
+        T_sig[2, 1] = nx * ny;
+        T_sig[2, 2] = nx ** 2 - ny ** 2
+
+        N = np.diag([1.0, 1.0, 2.0])
+        N_inv = np.diag([1.0, 1.0, 0.5])
+        T_eps = N @ T_sig @ N_inv
+        return T_sig, T_eps
+
+    def reset_trial(self):
+        self.lam_t = self.lam_t_old
+        self.lam_c = self.lam_c_old
+        self.lam_s = self.lam_s_old
+        self.W_pl_t = self.W_pl_t_old
+        self.W_pl_c = self.W_pl_c_old
+        self.W_pl_s = self.W_pl_s_old
+        self.D_nt = self.D_nt_old
+        self.D_nc = self.D_nc_old
+        self.D_s = self.D_s_old
+
+    def commit(self):
+        self.lam_t_old = self.lam_t
+        self.lam_c_old = self.lam_c
+        self.lam_s_old = self.lam_s
+        self.W_pl_t_old = self.W_pl_t
+        self.W_pl_c_old = self.W_pl_c
+        self.W_pl_s_old = self.W_pl_s
+        self.D_nt_old = self.D_nt
+        self.D_nc_old = self.D_nc
+        self.D_s_old = self.D_s
+
+    def c_curr(self, q):
+        return self.c if q <= self.q_lim else self.c + (q - self.q_lim) * self.tan_phi
+
+    def ft_curr(self, q):
+        return self.f_t + q
+
+    def update_damage(self, d_lam_t, d_lam_c, d_lam_s):
+        """Вычисляет повреждение для данной плоскости"""
+        q_new = self.H_t * self.lam_t
+
+        dW_t = max(self.sig_n_eff * d_lam_t, 0.0) if d_lam_t > 0 else 0.0
+        dW_c = max(abs(self.sig_n_eff) * d_lam_c, 0.0) if d_lam_c > 0 else 0.0
+        dW_s = max((abs(self.tau_eff) + self.sig_n_eff * self.tan_psi) * d_lam_s, 0.0) if d_lam_s > 0 else 0.0
+
+        self.W_pl_t = self.W_pl_t_old + dW_t
+        self.W_pl_c = self.W_pl_c_old + dW_c
+        self.W_pl_s = self.W_pl_s_old + dW_s
+
+        r_t = min(self.W_pl_t / self.Gf_t, 1.0)
+        r_c = min(self.W_pl_c / self.Gf_c, 1.0)
+        r_s = min(self.W_pl_s / self.Gf_s, 1.0)
+
+        Fp_t = r_t * (2.0 - r_t)
+        Fp_c = 0.5 * (np.sin(np.pi * r_c - 0.5 * np.pi) + 1.0)
+        Fp_s = r_s * (2.0 - r_s)
+
+        dt = Fp_t + self.a_t * Fp_s * (1.0 - Fp_t)
+        D_nt_new = 1.0 - (1.0 - dt) * self.f_t / (self.f_t + q_new + 1e-12)
+        D_nc_new = (1.0 - self.fcr_over_fc) * Fp_c
+
+        ds_base = min(max(self.a_s * Fp_t * (1 - Fp_s) * (1 - Fp_c) + Fp_s + Fp_c - Fp_s * Fp_c, 0.0), 1.0)
+
+        if self.sig_n_eff < 0.0:
+            abs_sn = -self.sig_n_eff
+            D_s_new = ds_base * (self.c + abs_sn * (self.tan_phi - self.tan_phi_r)) / (
+                        self.c + abs_sn * self.tan_phi + 1e-12)
+        else:
+            D_s_new = ds_base
+
+        self.D_nt = min(max(D_nt_new, self.D_nt_old), 0.99)
+        self.D_nc = min(max(D_nc_new, self.D_nc_old), 0.99)
+        self.D_s = min(max(D_s_new, self.D_s_old), 0.99)
+
+
+class MultiUbiquitousJointModel2D(ConstitutiveModel):
+    def __init__(self, material):
+        super().__init__(material)
+
+        E = self.material.E
+        nu = self.material.nu
+        jp = self.material.joint_params
+
+        self.E_min = 1e-5 * E
+        self.D_rock = self._build_plane_stress_stiffness(E, nu)
+        self.C_rock = np.linalg.inv(self.D_rock)
+
+        # Параметры мульти-модели
+        self.max_planes = 3
+        self.angle_tolerance = np.radians(30.0)
+        self.planes = []
+
+        # Извлечение параметров материала
+        self.phi = np.radians(jp.get('phi', 30.0))
+        self.psi = np.radians(jp.get('psi', 10.0))
+        self.phi_r = np.radians(jp.get('phi_r', np.degrees(self.phi)))
+
+        self.cp_material = jp.get('cp_material', None)
+        if self.cp_material is None:
+            raise ValueError("Требуется 'cp_material' в joint_params!")
+
+        self.cp_num_planes = jp.get('cp_num_planes', 100)
+        self.l_c = jp.get('l_c', 1.0)
+        self.Gf_t = jp.get('Gf_t', 100.0) / self.l_c
+        self.Gf_c = jp.get('Gf_c', 5000.0) / self.l_c
+        self.Gf_s = jp.get('Gf_s', 500.0) / self.l_c
+        self.a_t = jp.get('a_t', 1.0)
+        self.a_s = jp.get('a_s', 1.0)
+        self.mu = jp.get('mu', 0.1)
+        self.fcr_over_fc = jp.get('fcr_over_fc', 0.0)
+
+        self.nr_tol = jp.get('nr_tol', 1e-8)
+        self.nr_max_iter = jp.get('nr_max_iter', 25)
+
+        # Глобальные переменные
+        self.eps_p_old = np.zeros(3)
+        self.eps_p = np.zeros(3)
+        self.stress_old = np.zeros(3)
+        self.strain_old = np.zeros(3)
+        self.stress = np.zeros(3)
+        self.strain = np.zeros(3)
+        self.D_tangent = self.D_rock.copy()
+
+    def _build_plane_stress_stiffness(self, E, nu):
+        D = np.zeros((3, 3))
+        c1 = E / (1.0 - nu ** 2)
+        c2 = E * nu / (1.0 - nu ** 2)
+        G = E / (2.0 * (1.0 + nu))
+        D[0, 0] = D[1, 1] = c1
+        D[0, 1] = D[1, 0] = c2
+        D[2, 2] = G
+        return D
+
+    def _check_new_plane_allowed(self, new_normal):
+        if len(self.planes) >= self.max_planes:
+            return False
+        for p in self.planes:
+            cos_theta = abs(np.dot(p.normal, new_normal))
+            if cos_theta > np.cos(self.angle_tolerance):
+                return False
+        return True
+
+    def _global_return_mapping(self, sig_trial_eff):
+        """
+        Совместный Return Mapping для всех плоскостей.
+        Работает в эффективных напряжениях (до применения Damage).
+        """
+        tol = self.nr_tol
+
+        # Активные механизмы: список кортежей (plane_idx, mech_type)
+        # mech_type: 't', 'c', 's'
+        active_mechs = []
+
+        # Инициализируем trial состояния
+        for p in self.planes:
+            p.reset_trial()
+            sig_l_tr = p.T_sig @ sig_trial_eff
+            sn_tr, tau_tr = sig_l_tr[0], sig_l_tr[2]
+
+            q_old = p.H_t * p.lam_t_old
+            ft_yld = p.ft_curr(q_old)
+            c_yld = p.c_curr(q_old)
+
+            if sn_tr - ft_yld > tol:
+                active_mechs.append((p, 't'))
+            elif -sn_tr - p.f_c > tol:
+                active_mechs.append((p, 'c'))
+
+            if abs(tau_tr) + sn_tr * p.tan_phi - c_yld > tol: active_mechs.append((p, 's'))
+
+        if not active_mechs:
+            # Все упруго
+            for p in self.planes:
+                sig_l = p.T_sig @ sig_trial_eff
+                p.sig_n_eff, p.tau_eff = sig_l[0], sig_l[2]
+            return sig_trial_eff, np.zeros(3)
+
+        # Вектор неизвестных d_lam
+        n_vars = len(active_mechs)
+        d_lams = np.zeros(n_vars)
+
+        # Newton-Raphson
+        for _ in range(self.nr_max_iter):
+            # 1. Вычисляем текущие пластические деформации и напряжения
+            d_eps_p = np.zeros(3)
+            for i, (p, mech) in enumerate(active_mechs):
+                dl = d_lams[i]
+                v_local = np.zeros(3)
+                if mech == 't':
+                    v_local[0] = dl
+                elif mech == 'c':
+                    v_local[0] = -dl
+                elif mech == 's':
+                    sig_l_curr = p.T_sig @ (sig_trial_eff - self.D_rock @ d_eps_p)
+                    sign_tau = 1.0 if sig_l_curr[2] >= 0 else -1.0
+                    v_local[0] = dl * p.tan_psi
+                    v_local[2] = dl * sign_tau
+
+                d_eps_p += p.T_eps_inv.T @ v_local
+
+            sig_curr = sig_trial_eff - self.D_rock @ d_eps_p
+
+            # 2. Сборка невязок (Residual) и Якобиана
+            R = np.zeros(n_vars)
+            J = np.zeros((n_vars, n_vars))
+
+            for i, (p_i, mech_i) in enumerate(active_mechs):
+                sig_l_i = p_i.T_sig @ sig_curr
+                sn_i, tau_i = sig_l_i[0], sig_l_i[2]
+
+                # Поиск d_lam_t для текущей плоскости (нужен для q)
+                dl_t_idx = next((idx for idx, (p, m) in enumerate(active_mechs) if p == p_i and m == 't'), None)
+                dl_t_val = d_lams[dl_t_idx] if dl_t_idx is not None else 0.0
+                q_i = p_i.H_t * (p_i.lam_t_old + dl_t_val)
+
+                if mech_i == 't':
+                    R[i] = sn_i - p_i.ft_curr(q_i)
+                elif mech_i == 'c':
+                    R[i] = -sn_i - p_i.f_c
+                elif mech_i == 's':
+                    R[i] = abs(tau_i) + sn_i * p_i.tan_phi - p_i.c_curr(q_i)
+
+                # Градиенты для Якобиана
+                for j, (p_j, mech_j) in enumerate(active_mechs):
+                    # Направление пластического течения плоскости j
+                    df_dlam = 0.0
+
+                    v_j = np.zeros(3)
+                    if mech_j == 't':
+                        v_j[0] = 1.0
+                    elif mech_j == 'c':
+                        v_j[0] = -1.0
+                    elif mech_j == 's':
+                        sig_l_j = p_j.T_sig @ sig_curr
+                        v_j[0] = p_j.tan_psi
+                        v_j[2] = 1.0 if sig_l_j[2] >= 0 else -1.0
+
+                    # Влияние j на напряжения
+                    d_sig_d_lam_j = -self.D_rock @ (p_j.T_eps_inv.T @ v_j)
+                    d_sig_l_i = p_i.T_sig @ d_sig_d_lam_j
+
+                    if mech_i == 't':
+                        df_dlam = d_sig_l_i[0]
+                        if p_i == p_j and mech_j == 't': df_dlam -= p_i.H_t
+                    elif mech_i == 'c':
+                        df_dlam = -d_sig_l_i[0]
+                    elif mech_i == 's':
+                        sign_tau_i = 1.0 if tau_i >= 0 else -1.0
+                        df_dlam = sign_tau_i * d_sig_l_i[2] + d_sig_l_i[0] * p_i.tan_phi
+                        if p_i == p_j and mech_j == 't' and q_i > p_i.q_lim:
+                            df_dlam -= p_i.H_t * p_i.tan_phi
+
+                    J[i, j] = df_dlam
+
+            if np.linalg.norm(R) < tol:
+                break
+
+            try:
+                delta = np.linalg.solve(J, -R)
+            except np.linalg.LinAlgError:
+                delta = np.linalg.pinv(J) @ -R
+
+            d_lams += delta
+            d_lams = np.maximum(d_lams, 0.0)  # Проекция для предотвращения отрицательных множителей
+
+        # Обновление состояний плоскостей (в эффективном пространстве)
+        for i, (p, mech) in enumerate(active_mechs):
+            if mech == 't':
+                p.lam_t = p.lam_t_old + d_lams[i]
+            elif mech == 'c':
+                p.lam_c = p.lam_c_old + d_lams[i]
+            elif mech == 's':
+                p.lam_s = p.lam_s_old + d_lams[i]
+
+        for p in self.planes:
+            sig_l = p.T_sig @ sig_curr
+            p.sig_n_eff, p.tau_eff = sig_l[0], sig_l[2]
+
+            # Извлекаем приращения для Damage
+            dl_t = p.lam_t - p.lam_t_old
+            dl_c = p.lam_c - p.lam_c_old
+            dl_s = p.lam_s - p.lam_s_old
+            p.update_damage(dl_t, dl_c, dl_s)
+
+        return sig_curr, d_eps_p
+
+    def update_state(self, current_strain_voigt, compute_tangent=True):
+        self.strain = current_strain_voigt.copy()
+        delta_strain = self.strain - self.strain_old
+
+        # Trial эффективное напряжение
+        sig_trial_eff = self.stress_old + self.D_rock @ delta_strain
+
+        # 1. Проверка новых критических плоскостей
+        st_trial = StressTensor(sig_trial_eff[0], sig_trial_eff[1], 0.0, sig_trial_eff[2], 0.0, 0.0)
+        f_s, n_s, util_s = find_critical_plane_shear(st_trial, self.cp_material, num_planes=self.cp_num_planes)
+        f_t, n_t, util_t = find_critical_plane_tensile(st_trial, self.cp_material, num_planes=self.cp_num_planes)
+        max_f = max(f_s, f_t)
+
+        if max_f > 1e-10:
+            best_n = n_s if util_s > util_t else n_t
+            if self._check_new_plane_allowed(best_n):
+                new_plane = PlaneState(
+                    best_n, self.cp_material, self.D_rock, self.mu, self.l_c,
+                    self.Gf_t, self.Gf_c, self.Gf_s, self.a_t, self.a_s,
+                    self.fcr_over_fc, self.phi, self.psi, self.phi_r
+                )
+                self.planes.append(new_plane)
+                # Выводим сообщение только на реальном шаге, а не при расчете тангенса
+                if compute_tangent:
+                    print(f"Добавлена плоскость {len(self.planes)} с нормалью {best_n}")
+
+        # 2. Глобальный Return Mapping
+        sig_eff, d_eps_p = self._global_return_mapping(sig_trial_eff)
+        self.eps_p = self.eps_p_old + d_eps_p
+
+        # 3. Применение повреждения через секущую податливость
+        C_global = self.C_rock.copy()
+        for p in self.planes:
+            D_n = p.D_nt if p.sig_n_eff >= 0.0 else p.D_nc
+            D_s = p.D_s
+
+            C_extra_loc = np.zeros((3, 3))
+            if D_n > 1e-6: C_extra_loc[0, 0] = (D_n / (1.0 - D_n)) / p.E_n
+            if D_s > 1e-6: C_extra_loc[2, 2] = (D_s / (1.0 - D_s)) / p.G_s
+
+            C_global += p.T_eps_inv @ C_extra_loc @ p.T_sig
+
+        D_secant = np.linalg.inv(C_global)
+        eps_e = self.strain - self.eps_p
+        self.stress = D_secant @ eps_e
+
+        # 4. Вычисление численного тангенса
+        if compute_tangent:
+            self.D_tangent = self._compute_numerical_tangent(self.strain) + np.eye(3) * self.E_min
+
+        return self.stress.copy(), self.D_tangent
+
+    def _compute_numerical_tangent(self, current_strain, eps=1e-7):
+        D_num = np.zeros((3, 3))
+        scale = max(np.linalg.norm(current_strain), 1.0)
+        h = eps * scale
+
+        # Сохраняем состояние
+        saved_stress = self.stress.copy()
+        saved_eps_p = self.eps_p.copy()
+        saved_num_planes = len(self.planes)
+        saved_planes = [(p.lam_t, p.lam_c, p.lam_s, p.W_pl_t, p.W_pl_c, p.W_pl_s, p.D_nt, p.D_nc, p.D_s) for p in
+                        self.planes]
+
+        for j in range(3):
+            ep = current_strain.copy();
+            ep[j] += h
+            em = current_strain.copy();
+            em[j] -= h
+
+            # Временный апдейт БЕЗ расчета тангенса (прерываем рекурсию)
+            self.update_state(ep, compute_tangent=False);
+            sig_p = self.stress.copy()
+            self._restore_state(saved_stress, saved_eps_p, saved_planes, saved_num_planes)
+
+            self.update_state(em, compute_tangent=False);
+            sig_m = self.stress.copy()
+            self._restore_state(saved_stress, saved_eps_p, saved_planes, saved_num_planes)
+
+            D_num[:, j] = (sig_p - sig_m) / (2.0 * h)
+
+        return D_num
+
+    def _restore_state(self, s_stress, s_eps_p, s_planes, s_num_planes):
+        self.stress = s_stress.copy()
+        self.eps_p = s_eps_p.copy()
+
+        # Если при возмущении создалась ложная плоскость, удаляем её
+        if len(self.planes) > s_num_planes:
+            self.planes = self.planes[:s_num_planes]
+
+        for p, state in zip(self.planes, s_planes):
+            p.lam_t, p.lam_c, p.lam_s, p.W_pl_t, p.W_pl_c, p.W_pl_s, p.D_nt, p.D_nc, p.D_s = state
+
+    def get_tangent_matrix(self):
+        return self.D_tangent
+
+    def get_stress(self, strain):
+        return self.stress
+
+    def commit(self):
+        self.stress_old = self.stress.copy()
+        self.strain_old = self.strain.copy()
+        self.eps_p_old = self.eps_p.copy()
+        for p in self.planes:
+            p.commit()
+
+
+====================
+File: .\FEM\Integration_Point_Level\UbiquitousJointModel2D.py
+====================
+
+import numpy as np
+
+from FEM.Integration_Point_Level.CriticalPlane.criterion import (
+    find_critical_plane_shear,
+    find_critical_plane_tensile,
+    find_critical_plane_compression,
+    get_tensile_limit,
+    get_compression_limit,
+    get_cohesion_limit
+)
+from FEM.Integration_Point_Level.CriticalPlane.tensor import StressTensor
+from FEM.Abstract.Integration_Point_Level import ConstitutiveModel
+
+
+class UbiquitousJointModel2D(ConstitutiveModel):
     """
-    Строгая модель Ubiquitous Joint с заранее заданной горизонтальной плоскостью ослабления (0, 0, 1).
-    - Не ищет критическую плоскость.
-    - Сразу инициализируется с учетом податливости горизонтальной трещины.
-    - Выполняет алгоритм Return Mapping для сдвига и отрыва.
+    2D Ubiquitous-Joint Damage-Plasticity модель по статье Minga et al. 2017.
+    Реализован алгоритмически-разделенный Return Mapping и Consistent Tangent Matrix.
     """
 
     def __init__(self, material):
@@ -777,194 +1479,361 @@ class FixedHorizontalJointModel3D(ConstitutiveModel):
         nu = self.material.nu
         jp = self.material.joint_params
 
-        # --- 1. Параметры трещины ---
-        self.kn, self.ks, self.kt, self.S = jp['kn'], jp['ks'], jp['kt'], jp['spacing']
-        self.c = jp.get('c', 0.0)
-        self.phi = np.radians(jp.get('phi', 0.0))
-        self.psi = np.radians(jp.get('psi', 0.0))
-        self.t_limit = jp.get('t', 0.0)
+        self.E_min = 1e-5 * E
 
-        # Ограничение на растяжение (Apex correction)
-        if self.phi > 0:
-            t_max = self.c / np.tan(self.phi)
-            self.t_limit = min(self.t_limit, t_max)
+        self.phi = np.radians(jp.get('phi', 30.0))
+        self.psi = np.radians(jp.get('psi', 10.0))
+        self.phi_r = np.radians(jp.get('phi_r', np.degrees(self.phi)))
+        self.tan_phi = np.tan(self.phi)
+        self.tan_psi = np.tan(self.psi)
+        self.tan_phi_r = np.tan(self.phi_r)
 
-        # --- 2. Упругая матрица целой породы ---
-        self.C_rock = self._build_isotropic_compliance(E, nu)
-        self.D_rock = np.linalg.inv(self.C_rock)
+        self.cp_material = jp.get('cp_material', None)
+        if self.cp_material is None:
+            raise ValueError("Требуется 'cp_material' в joint_params!")
 
-        # --- 3. Переменные состояния напряжений/деформаций ---
-        self.stress_old = np.zeros(6)
-        self.strain_old = np.zeros(6)
-        self.stress = np.zeros(6)
-        self.strain = np.zeros(6)
+        self.cp_num_planes = jp.get('cp_num_planes', 100)
+        self.lock_on_yield = jp.get('lock_on_yield', True)
 
-        # --- 4. Фиксация горизонтальной плоскости (0, 0, 1) ---
-        self.fixed_normal = np.array([0.0, 0.0, 1.0])
-        self.R = np.eye(3)  # Для (0,0,1) матрица поворота - это единичная матрица
-        self.D_eq_local = None
-        self.D_eq_global = None
-        self.alpha_1 = 0.0
-        self.alpha_2 = 0.0
+        self.preset_plane_normal = jp.get('preset_plane_normal', None)
+        self.force_horizontal = jp.get('force_horizontal', False)
+        if self.force_horizontal:
+            self.preset_plane_normal = np.array([0.05, 0.9987, 0])
 
-        # Сразу вызываем процедуру фиксации
-        self._lock_plane(self.fixed_normal)
+        self.l_c = jp.get('l_c', 1.0)
+        self.Gf_t = jp.get('Gf_t', 1.0) / self.l_c
+        self.Gf_c = jp.get('Gf_c', 1.0) / self.l_c
+        self.Gf_s = jp.get('Gf_s', 1.0) / self.l_c
 
-    def _build_isotropic_compliance(self, E, nu):
-        C = np.zeros((6, 6))
+        self.a_t = jp.get('a_t', 1.0)
+        self.a_s = jp.get('a_s', 1.0)
+        self.mu = jp.get('mu', 0.1)
+        self.fcr_over_fc = jp.get('fcr_over_fc', 0.0)
+
+        self.D_rock = self._build_plane_stress_stiffness(E, nu)
+        self.D_tangent = self.D_rock.copy()
+
+        self.is_locked = False
+        self.fixed_normal = None
+        self.T_sig = np.eye(3)
+        self.T_eps = np.eye(3)
+        self.D_local = self.D_rock.copy()
+
+        self.E_n = self.D_local[0, 0]
+        self.G_s = self.D_local[2, 2]
+
+        self.f_t = self.f_c = self.c = self.q_lim = self.H_t = 0.0
+
+        self._init_history()
+
+    def _init_history(self):
+        # История для эффективных напряжений (Minga Eq. 9)
+        self.sig_eff_old = np.zeros(3)
+        self.eps_p_old = np.zeros(3)
+
+        self.q_old = 0.0
+        self.W_pl_t_old = self.W_pl_c_old = self.W_pl_s_old = 0.0
+
+        self.stress_old = np.zeros(3)
+        self.strain_old = np.zeros(3)
+        self.stress = np.zeros(3)
+        self.strain = np.zeros(3)
+        self._reset_trial()
+
+    def _reset_trial(self):
+        self.sig_eff_trial = self.sig_eff_old.copy()
+        self.eps_p_trial = self.eps_p_old.copy()
+        self.q_trial = self.q_old
+        self.W_pl_t_trial = self.W_pl_t_old
+        self.W_pl_c_trial = self.W_pl_c_old
+        self.W_pl_s_trial = self.W_pl_s_old
+
+    def _build_plane_stress_stiffness(self, E, nu):
+        D = np.zeros((3, 3))
+        c1 = E / (1.0 - nu ** 2)
+        c2 = E * nu / (1.0 - nu ** 2)
         G = E / (2.0 * (1.0 + nu))
-        C[0, 0] = C[1, 1] = C[2, 2] = 1.0 / E
-        C[0, 1] = C[0, 2] = C[1, 0] = C[1, 2] = C[2, 0] = C[2, 1] = -nu / E
-        C[3, 3] = C[4, 4] = C[5, 5] = 1.0 / G
-        return C
+        D[0, 0] = D[1, 1] = c1
+        D[0, 1] = D[1, 0] = c2
+        D[2, 2] = G
+        return D
 
-    def _build_joint_compliance(self, kn, ks, kt, S):
-        C = np.zeros((6, 6))
-        C[2, 2] = 1.0 / (kn * S)
-        C[4, 4] = 1.0 / (kt * S)
-        C[5, 5] = 1.0 / (ks * S)
-        return C
+    def _build_2d_voigt_transformation(self, nx, ny):
+        T_sig = np.zeros((3, 3))
+        T_sig[0, 0] = nx ** 2;
+        T_sig[0, 1] = ny ** 2;
+        T_sig[0, 2] = 2.0 * nx * ny
+        T_sig[1, 0] = ny ** 2;
+        T_sig[1, 1] = nx ** 2;
+        T_sig[1, 2] = -2.0 * nx * ny
+        T_sig[2, 0] = -nx * ny;
+        T_sig[2, 1] = nx * ny;
+        T_sig[2, 2] = nx ** 2 - ny ** 2
 
-    def _build_rotation_matrix(self, n):
-        nz = np.array(n) / np.linalg.norm(n)
-        if abs(nz[2]) > 0.999:
-            nx = np.array([1.0, 0.0, 0.0])
-            ny = np.cross(nz, nx)
+        N = np.diag([1.0, 1.0, 2.0])
+        N_inv = np.diag([1.0, 1.0, 0.5])
+        T_eps = N @ T_sig @ N_inv
+        return T_sig, T_eps
+
+    def _lock_plane(self, normal, stress_tensor_3d):
+        nx, ny = normal[0], normal[1]
+        norm = np.hypot(nx, ny)
+        if norm < 1e-12:
+            nx, ny = 1.0, 0.0
         else:
-            ny = np.cross(nz, [0.0, 0.0, 1.0])
-            ny /= np.linalg.norm(ny)
-            nx = np.cross(ny, nz)
-        nx /= np.linalg.norm(nx)
-        return np.column_stack((nx, ny, nz))
+            nx /= norm; ny /= norm
 
-    def _rotate_matrix(self, D, R):
-        """Вращение матрицы жесткости 6x6"""
-        D_glob = np.zeros((6, 6))
-        for j in range(6):
-            e_g = np.zeros(6)
-            e_g[j] = 1.0
-            et_g = np.array(
-                [[e_g[0], e_g[3] / 2, e_g[5] / 2], [e_g[3] / 2, e_g[1], e_g[4] / 2], [e_g[5] / 2, e_g[4] / 2, e_g[2]]])
-            et_l = R.T @ et_g @ R
-            ev_l = np.array([et_l[0, 0], et_l[1, 1], et_l[2, 2], 2 * et_l[0, 1], 2 * et_l[1, 2], 2 * et_l[0, 2]])
+        self.fixed_normal = np.array([nx, ny])
+        self.T_sig, self.T_eps = self._build_2d_voigt_transformation(nx, ny)
 
-            sv_l = D @ ev_l
-            st_l = np.array([[sv_l[0], sv_l[3], sv_l[5]], [sv_l[3], sv_l[1], sv_l[4]], [sv_l[5], sv_l[4], sv_l[2]]])
-            st_g = R @ st_l @ R.T
-            D_glob[:, j] = np.array([st_g[0, 0], st_g[1, 1], st_g[2, 2], st_g[0, 1], st_g[1, 2], st_g[0, 2]])
-        return D_glob
+        self.D_local = self.T_sig @ self.D_rock @ np.linalg.inv(self.T_eps)
+        self.E_n = self.D_local[0, 0]
+        self.G_s = self.D_local[2, 2]
 
-    def _lock_plane(self, normal):
-        """Процедура инициализации матриц жесткости для заданной плоскости"""
-        self.R = self._build_rotation_matrix(normal)
+        self.f_t = max(get_tensile_limit(normal, self.cp_material), 1e-12)
+        self.f_c = max(get_compression_limit(normal, self.cp_material), 1e-12)
+        self.c = max(get_cohesion_limit(normal, stress_tensor_3d, self.cp_material), 1e-12)
+        print(self.c)
 
-        # Добавляем податливость трещины к породе
-        C_joint_local = self._build_joint_compliance(self.kn, self.ks, self.kt, self.S)
-        C_eq_local = self.C_rock + C_joint_local
-        self.D_eq_local = np.linalg.inv(C_eq_local)
+        # Ограничиваем H_t, чтобы избежать сингулярности матрицы (Snap-back limit)
+        denom = (1.0 + self.f_t ** 2 / (3.0 * self.E_n * self.Gf_t)) * self.mu - 1.0
+        self.H_t = abs(self.E_n / denom) if denom != 0 else self.E_n * 0.1
+        self.H_t = min(self.H_t, self.E_n * 0.9)  # Защита от потери положительной определенности
 
-        # Модули для Return Mapping
-        self.alpha_1 = self.D_eq_local[2, 2]
-        self.alpha_2 = (self.D_eq_local[4, 4] + self.D_eq_local[5, 5]) / 2.0
+        self.q_lim = np.inf if self.tan_phi < 1e-12 else self.c / self.tan_phi - self.f_t
+        self.is_locked = True
 
-        # Глобальная эквивалентная матрица с учетом трещины
-        self.D_eq_global = self._rotate_matrix(self.D_eq_local, self.R)
+    def _c_curr(self, q):
+        if q <= self.q_lim: return self.c
+        return self.c + (q - self.q_lim) * self.tan_phi
 
-    def update_state(self, current_strain):
-        self.strain = current_strain
-        d_strain = current_strain - self.strain_old
+    # ===================== АНАЛИТИЧЕСКИЙ RETURN MAPPING (Eq. 33-35) =====================
+    def _return_mapping_analytical(self, deps_l):
+        """
+        Точное аналитическое решение задачи пластичности в локальных координатах.
+        Возвращает эффективные напряжения и эластопластическую касательную Kep (Eq. 38).
+        """
+        # Упругий предиктор (Trial state)
+        sig_tr = self.sig_eff_old + self.D_local @ deps_l
+        sn_tr = sig_tr[0]
+        tau_tr = sig_tr[2]
 
-        # ==========================================================
-        # РАБОТА С ЗАФИКСИРОВАННОЙ ТРЕЩИНОЙ (Return Mapping)
-        # ==========================================================
-        # Считаем пробное напряжение с учетом податливости трещины (D_eq_global)
-        sig_tr_v = self.stress_old + self.D_eq_global @ d_strain
+        abs_tau_tr = abs(tau_tr)
+        sign_tau = 1.0 if tau_tr >= 0 else -1.0
 
-        # Перевод в локальные оси трещины (для нормали (0,0,1) локальные оси совпадают с глобальными,
-        # но мы оставляем умножение для полной математической строгости)
-        st_t = np.array([[sig_tr_v[0], sig_tr_v[3], sig_tr_v[5]],
-                         [sig_tr_v[3], sig_tr_v[1], sig_tr_v[4]],
-                         [sig_tr_v[5], sig_tr_v[4], sig_tr_v[2]]])
-        sig_tr_l_t = self.R.T @ st_t @ self.R
+        ft_curr = self.f_t + self.q_old
+        c_curr = self._c_curr(self.q_old)
 
-        s33, s13, s23 = sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2]
-        tau = np.sqrt(s13 ** 2 + s23 ** 2)
+        F1_tr = sn_tr - ft_curr
+        F3_tr = -sn_tr - self.f_c
+        F2_tr = abs_tau_tr + sn_tr * self.tan_phi - c_curr
 
-        # Проверка критериев
-        f_s = tau + s33 * np.tan(self.phi) - self.c
-        f_t = s33 - self.t_limit
+        Kep_local = self.D_local.copy()
 
-        if f_s <= 0 and f_t <= 0:
-            self.stress = sig_tr_v
-            return self.stress, self.D_eq_global
+        # 1. Упругое состояние
+        if F1_tr <= 0 and F2_tr <= 0 and F3_tr <= 0:
+            return sig_tr, np.zeros(3), 0.0, Kep_local
 
-        # --- АЛГОРИТМИЧЕСКИЙ ВОЗВРАТ И СОГЛАСОВАННАЯ МАТРИЦА ---
-        D_tan_l = self.D_eq_local.copy()
+        sn_new = sn_tr
+        tau_new = tau_tr
+        dlams = np.zeros(3)  # [dlam_t, dlam_c, dlam_s]
 
-        if f_t > 0 or (f_s > 0 and (s33 + (f_s / self.alpha_2) * self.alpha_1 * np.tan(self.psi)) > self.t_limit):
-            # Отрыв
-            sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2] = self.t_limit, 0, 0
-            D_tan_l[2, :] = 0;
-            D_tan_l[:, 2] = 0
-            D_tan_l[4, :] = 0;
-            D_tan_l[:, 4] = 0
-            D_tan_l[5, :] = 0;
-            D_tan_l[:, 5] = 0
+        # 2. Только отрыв (F1)
+        if F1_tr > 0 and (abs_tau_tr + ft_curr * self.tan_phi - c_curr) <= 0:
+            dlam_t = F1_tr / (self.E_n + self.H_t)
+            sn_new = sn_tr - self.E_n * dlam_t
+            dlams[0] = dlam_t
+            Kep_local[0, 0] = (self.E_n * self.H_t) / (self.E_n + self.H_t)
+
+        # 3. Только сжатие (F3)
+        elif F3_tr > 0:
+            dlam_c = F3_tr / self.E_n
+            sn_new = -self.f_c
+            dlams[1] = dlam_c
+            Kep_local[0, 0] = 0.0
+
+        # 4. Только сдвиг (F2)
+        elif F2_tr > 0 and F1_tr <= 0:
+            denom = self.G_s + self.E_n * self.tan_phi * self.tan_psi
+            dlam_s = F2_tr / denom
+            sn_new = sn_tr - self.E_n * dlam_s * self.tan_psi
+            tau_new = sign_tau * (abs_tau_tr - self.G_s * dlam_s)
+            dlams[2] = dlam_s
+
+            # Analytical tangent for shear
+            Kep_local[0, 0] -= (self.E_n ** 2 * self.tan_phi * self.tan_psi) / denom
+            Kep_local[0, 2] -= sign_tau * (self.E_n * self.G_s * self.tan_psi) / denom
+            Kep_local[2, 0] -= sign_tau * (self.E_n * self.G_s * self.tan_phi) / denom
+            Kep_local[2, 2] -= (self.G_s ** 2) / denom
+
+        # 5. Отрыв + Сдвиг (Apex / Corner)
+        elif F1_tr > 0 and F2_tr > 0:
+            # Решаем 2x2 систему аналитически
+            A = np.array([
+                [self.E_n + self.H_t, self.E_n * self.tan_psi],
+                [self.E_n * self.tan_phi, self.G_s + self.E_n * self.tan_phi * self.tan_psi]
+            ])
+            B = np.array([F1_tr, F2_tr])
+            try:
+                x = np.linalg.solve(A, B)
+                dlam_t, dlam_s = x[0], x[1]
+                if dlam_t < 0 or dlam_s < 0:  # Fallback если вышли за угол
+                    dlam_t = max(dlam_t, 0.0)
+                    dlam_s = max(dlam_s, 0.0)
+            except np.linalg.LinAlgError:
+                dlam_t, dlam_s = 0.0, 0.0
+
+            sn_new = sn_tr - self.E_n * (dlam_t + dlam_s * self.tan_psi)
+            tau_new = sign_tau * (abs_tau_tr - self.G_s * dlam_s)
+            dlams[0] = dlam_t
+            dlams[2] = dlam_s
+
+            # Tangent at apex is purely hardening-driven
+            invA = np.linalg.inv(A)
+            # Kep = K - K * invA * K
+            K_mat = np.array([[self.E_n, 0], [0, self.G_s]])
+            Kep_sub = K_mat - K_mat @ invA @ K_mat
+            Kep_local[0, 0] = Kep_sub[0, 0]
+            Kep_local[0, 2] = sign_tau * Kep_sub[0, 1]
+            Kep_local[2, 0] = sign_tau * Kep_sub[1, 0]
+            Kep_local[2, 2] = Kep_sub[1, 1]
+
+        sig_eff_new = sig_tr.copy()
+        sig_eff_new[0] = sn_new
+        sig_eff_new[2] = tau_new
+
+        return sig_eff_new, dlams, dlams[0] * self.H_t, Kep_local
+
+    # ===================== РАСЧЕТ ПОВРЕЖДЕННОСТИ (Eq. 16-32) =====================
+    def _calculate_damage(self, W_pl_t, W_pl_c, W_pl_s, q_new, sn_eff):
+        r_t = min(W_pl_t / self.Gf_t, 1.0)
+        r_c = min(W_pl_c / self.Gf_c, 1.0)
+        r_s = min(W_pl_s / self.Gf_s, 1.0)
+
+        Fp_t = r_t * (2.0 - r_t)
+        Fp_c = 0.5 * (np.sin(np.pi * r_c - 0.5 * np.pi) + 1.0)
+        Fp_s = r_s * (2.0 - r_s)
+
+        # Eq. 20-22: Damage in tension
+        dt = Fp_t + self.a_t * Fp_s * (1.0 - Fp_t)
+        D_nt = 1.0 - (1.0 - dt) * self.f_t / (self.f_t + q_new + 1e-12)
+
+        # Eq. 28: Damage in compression
+        D_nc = (1.0 - self.fcr_over_fc) * Fp_c
+
+        # Eq. 29-32: Damage in shear
+        ds_base = min(max(self.a_s * Fp_t * (1 - Fp_s) * (1 - Fp_c) + Fp_s + Fp_c - Fp_s * Fp_c, 0.0), 1.0)
+        if sn_eff < 0.0:
+            abs_sn = -sn_eff
+            D_s = ds_base * (self.c + abs_sn * (self.tan_phi - self.tan_phi_r)) / (
+                        self.c + abs_sn * self.tan_phi + 1e-12)
         else:
-            # Сдвиг
-            tan_phi, tan_psi = np.tan(self.phi), np.tan(self.psi)
-            lam = f_s / (self.alpha_2 + self.alpha_1 * tan_phi * tan_psi)
+            D_s = ds_base
 
-            sig_33_new = s33 - lam * self.alpha_1 * tan_psi
-            tau_new = tau - lam * self.alpha_2
+        return min(D_nt, 0.999), min(D_nc, 0.999), min(D_s, 0.999)
 
-            apex_stress = self.c / tan_phi if self.phi > 0 else float('inf')
+    # ===================== ГЛАВНЫЙ ВХОД И CONSISTENT TANGENT =====================
+    def update_state(self, current_strain_voigt):
+        self.strain = current_strain_voigt.copy()
+        self._reset_trial()
 
-            if sig_33_new > apex_stress:
-                sig_tr_l_t[2, 2], sig_tr_l_t[0, 2], sig_tr_l_t[1, 2] = apex_stress, 0, 0
-                D_tan_l[2, :] = 0;
-                D_tan_l[:, 2] = 0
-                D_tan_l[4, :] = 0;
-                D_tan_l[:, 4] = 0
-                D_tan_l[5, :] = 0;
-                D_tan_l[:, 5] = 0
+        if not self.is_locked:
+            sig_tr = self.stress_old + self.D_rock @ (self.strain - self.strain_old)
+            sig_tr_3d = np.array([sig_tr[0], sig_tr[1], 0.0, sig_tr[2], 0.0, 0.0])
+            st = StressTensor(*sig_tr_3d)
+
+            if self.preset_plane_normal is not None:
+                self._lock_plane(self.preset_plane_normal, st)
             else:
-                sig_tr_l_t[2, 2] = sig_33_new
-                if tau > 0:
-                    factor = tau_new / tau
-                    sig_tr_l_t[0, 2] *= factor
-                    sig_tr_l_t[1, 2] *= factor
+                f_s, n_s, u_s = find_critical_plane_shear(st, self.cp_material, self.cp_num_planes)
+                f_t, n_t, u_t = find_critical_plane_tensile(st, self.cp_material, self.cp_num_planes)
+                f_c, n_c, u_c = find_critical_plane_compression(st, self.cp_material, self.cp_num_planes)
 
-                n_vec, m_vec = np.zeros(6), np.zeros(6)
-                n_vec[2], m_vec[2] = tan_phi, tan_psi
-                if tau > 0:
-                    n_vec[4] = m_vec[4] = s23 / tau
-                    n_vec[5] = m_vec[5] = s13 / tau
+                max_f = max(f_s, f_t, f_c)
+                if self.lock_on_yield and max_f <= 1e-10:
+                    self.stress = sig_tr
+                    self.D_tangent = self.D_rock.copy()
+                    return self.stress.copy(), self.D_tangent
+                else:
+                    max_u = max(u_s, u_t, u_c)
+                    best_n = n_s if max_u == u_s else (n_t if max_u == u_t else n_c)
+                    self._lock_plane(best_n, st)
 
-                D_m = self.D_eq_local @ m_vec
-                n_D = n_vec @ self.D_eq_local
-                denom = np.dot(n_vec, D_m)
+        # 1. Strain increment in local coordinates
+        deps_global = self.strain - self.strain_old
+        deps_l = self.T_eps @ deps_global
 
-                if abs(denom) > 1e-12:
-                    D_ep = self.D_eq_local - np.outer(D_m, n_D) / denom
-                    if tau > 0:
-                        beta = tau_new / tau
-                        delta_D = np.zeros((6, 6))
-                        delta_D[4, 4] = self.alpha_2 * (1 - (s23 / tau) ** 2)
-                        delta_D[5, 5] = self.alpha_2 * (1 - (s13 / tau) ** 2)
-                        delta_D[4, 5] = delta_D[5, 4] = -self.alpha_2 * (s23 / tau) * (s13 / tau)
-                        D_tan_l = D_ep - (1 - beta) * delta_D
-                    else:
-                        D_tan_l = D_ep
+        # 2. Plasticity Return Mapping -> Effective stress & Elastoplastic Tangent (Eq 38)
+        sig_eff_new, dlams, dq, Kep_local = self._return_mapping_analytical(deps_l)
 
-        # Обратный перевод напряжений и касательной матрицы
-        st_g = self.R @ sig_tr_l_t @ self.R.T
-        self.stress = np.array([st_g[0, 0], st_g[1, 1], st_g[2, 2], st_g[0, 1], st_g[1, 2], st_g[0, 2]])
+        # 3. Update Plastic Work
+        dW_t = max(sig_eff_new[0] * dlams[0], 0.0)
+        dW_c = max(abs(sig_eff_new[0]) * dlams[1], 0.0)
+        dW_s = max((abs(sig_eff_new[2]) + sig_eff_new[0] * self.tan_psi) * dlams[2], 0.0)
 
-        return self.stress, self._rotate_matrix(D_tan_l, self.R)
+        W_pl_t = self.W_pl_t_old + dW_t
+        W_pl_c = self.W_pl_c_old + dW_c
+        W_pl_s = self.W_pl_s_old + dW_s
+        q_new = self.q_old + dq
+
+        # 4. Calculate Damage
+        D_nt, D_nc, D_s = self._calculate_damage(W_pl_t, W_pl_c, W_pl_s, q_new, sig_eff_new[0])
+        D_n = D_nt if sig_eff_new[0] >= 0 else D_nc
+
+        # 5. Nominal Stress (Eq. 3)
+        sig_l_nom = sig_eff_new.copy()
+        sig_l_nom[0] *= (1.0 - D_n)
+        sig_l_nom[2] *= (1.0 - D_s)
+
+        # 6. Consistent Tangent Matrix Kc (Eq. 37)
+        # Kc = (I - D) * Kep - dD/deps * sig_eff
+        # Используем полу-аналитический подход: Kep точный, Damage часть через локальное возмущение
+        Kc_local = Kep_local.copy()
+        Kc_local[0, :] *= (1.0 - D_n)
+        Kc_local[2, :] *= (1.0 - D_s)
+
+        # Локальное возмущение ТОЛЬКО для поврежденности (очень быстро, без решения СЛАУ)
+        if dlams[0] > 0 or dlams[1] > 0 or dlams[2] > 0:
+            h = 1e-8
+            for j in [0, 2]:
+                deps_pert = deps_l.copy()
+                deps_pert[j] += h
+
+                # Быстрый прямой проход без истории
+                sig_eff_h, dlams_h, dq_h, _ = self._return_mapping_analytical(deps_pert)
+                Wt_h = self.W_pl_t_old + max(sig_eff_h[0] * dlams_h[0], 0.0)
+                Wc_h = self.W_pl_c_old + max(abs(sig_eff_h[0]) * dlams_h[1], 0.0)
+                Ws_h = self.W_pl_s_old + max((abs(sig_eff_h[2]) + sig_eff_h[0] * self.tan_psi) * dlams_h[2], 0.0)
+
+                Dnt_h, Dnc_h, Ds_h = self._calculate_damage(Wt_h, Wc_h, Ws_h, self.q_old + dq_h, sig_eff_h[0])
+                Dn_h = Dnt_h if sig_eff_h[0] >= 0 else Dnc_h
+
+                dDn_deps = (Dn_h - D_n) / h
+                dDs_deps = (Ds_h - D_s) / h
+
+                Kc_local[0, j] -= dDn_deps * sig_eff_new[0]
+                Kc_local[2, j] -= dDs_deps * sig_eff_new[2]
+
+        # 7. Transform back to global
+        self.stress = self.T_eps.T @ sig_l_nom
+        self.D_tangent = self.T_eps.T @ Kc_local @ self.T_eps
+
+        # Save history
+        self.sig_eff_trial = sig_eff_new
+        self.q_trial = q_new
+        self.W_pl_t_trial = W_pl_t
+        self.W_pl_c_trial = W_pl_c
+        self.W_pl_s_trial = W_pl_s
+        self.eps_p_trial = self.eps_p_old + np.array([
+            dlams[0] - dlams[1] + dlams[2] * self.tan_psi,
+            0,
+            dlams[2] * (1.0 if sig_eff_new[2] >= 0 else -1.0)
+        ])
+
+        return self.stress.copy(), self.D_tangent
 
     def get_tangent_matrix(self):
-        return self.D_eq_global
+        return self.D_tangent
 
     def get_stress(self, strain):
         return self.stress
@@ -972,6 +1841,12 @@ class FixedHorizontalJointModel3D(ConstitutiveModel):
     def commit(self):
         self.stress_old = self.stress.copy()
         self.strain_old = self.strain.copy()
+        self.sig_eff_old = self.sig_eff_trial.copy()
+        self.eps_p_old = self.eps_p_trial.copy()
+        self.q_old = self.q_trial
+        self.W_pl_t_old = self.W_pl_t_trial
+        self.W_pl_c_old = self.W_pl_c_trial
+        self.W_pl_s_old = self.W_pl_s_trial
 
 
 ====================
@@ -983,6 +1858,7 @@ import numpy as np
 from FEM.Integration_Point_Level.CriticalPlane.criterion import (
     find_critical_plane_shear,
     find_critical_plane_tensile,
+    find_critical_plane_compression,
     get_tensile_limit,
     get_compression_limit,
     get_cohesion_limit
@@ -992,6 +1868,13 @@ from FEM.Abstract.Integration_Point_Level import ConstitutiveModel
 
 
 class UbiquitousJointModel3D(ConstitutiveModel):
+    """
+    3D Ubiquitous-Joint Damage-Plasticity модель в нотации Войгта.
+    Автоматически ищет критическую плоскость при наступлении пластичности.
+    """
+
+    # ============================ INIT ============================
+
     def __init__(self, material):
         super().__init__(material)
 
@@ -1001,57 +1884,92 @@ class UbiquitousJointModel3D(ConstitutiveModel):
 
         self.E_min = 1e-5 * E
 
-        # Базовые параметры
+        # --- Углы трения / дилатансии ---
         self.phi = np.radians(jp.get('phi', 30.0))
         self.psi = np.radians(jp.get('psi', 10.0))
+        self.phi_r = np.radians(jp.get('phi_r', np.degrees(self.phi)))
         self.tan_phi = np.tan(self.phi)
         self.tan_psi = np.tan(self.psi)
+        self.tan_phi_r = np.tan(self.phi_r)
 
+        # --- Critical-plane материал ---
         self.cp_material = jp.get('cp_material', None)
         if self.cp_material is None:
             raise ValueError("Требуется 'cp_material' в joint_params!")
 
-        # Энергии разрушения
+        # Количество площадок для дискретного поиска (по умолчанию 100)
+        self.cp_num_planes = jp.get('cp_num_planes', 100)
+
+        # Фиксировать площадку только при достижении предела прочности (True по умолчанию)
+        self.lock_on_yield = jp.get('lock_on_yield', True)
+
+        # --- Энергии разрушения, регуляризованные l_c ---
         self.l_c = jp.get('l_c', 1.0)
         self.Gf_t = jp.get('Gf_t', 100.0) / self.l_c
         self.Gf_c = jp.get('Gf_c', 5000.0) / self.l_c
         self.Gf_s = jp.get('Gf_s', 500.0) / self.l_c
 
-        self.H_t = 0.0
-        self.H_c = 0.0
-        self.H_s = 0.0
+        # --- Перекрёстные коэффициенты damage (Minga, Eq. 20, 29) ---
+        self.a_t = jp.get('a_t', 1.0)
+        self.a_s = jp.get('a_s', 1.0)
 
-        # Переменные состояния
+        # --- Параметр μ для остаточной нормальной деформации (Minga Eq. 23) ---
+        self.mu = jp.get('mu', 0.1)
+
+        # --- Доля остаточной прочности на сжатие fcr/fc (Minga Eq. 28) ---
+        self.fcr_over_fc = jp.get('fcr_over_fc', 0.0)
+
+        self.H_t = self.H_c = self.H_s = 0.0
+
+        # --- Параметры Newton-Raphson ---
+        self.nr_tol = jp.get('nr_tol', 1e-10)
+        self.nr_max_iter = jp.get('nr_max_iter', 25)
+
+        # --- Переменные состояния ---
         self._init_history()
 
-        self.D_rock = self._build_isotropic_stiffness(E, nu)
+        # --- Матрица жёсткости породы (Войгт) ---
+        self.D_rock = self._build_isotropic_stiffness_voigt(E, nu)
         self.D_tangent = self.D_rock.copy()
 
+        # --- Состояние локализации ---
         self.is_locked = False
         self.fixed_normal = None
         self.R = np.eye(3)
         self.T_sig = np.eye(6)
         self.T_eps = np.eye(6)
-        self.D_local = self.D_rock.copy()
 
+        self.D_local = self.D_rock.copy()
         self.E_n = self.D_local[2, 2]
         self.G_s = self.D_local[4, 4]
 
-        # Флаг для выбора метода вычисления CTO
-        # 'numerical' гарантирует идеальную сходимость для сложных Damage моделей
-        self.tangent_type = 'numerical'
+        # --- Прочностные пределы на плоскости ---
+        self.f_t = 0.0
+        self.f_c = 0.0
+        self.c = 0.0
+        self.q_lim = 0.0
+
+        # Переменные для передачи в Tangent Stiffness
+        self._last_J_inv = None
+        self._last_active_flags = (False, False, False)
+        self._last_sig_eff = np.zeros(3)
+        self._last_d_lams = np.zeros(3)
+        self._last_W_pls = np.zeros(3)
+        self._last_q_new = 0.0
+
+    # ============================ HISTORY ============================
 
     def _init_history(self):
         self.lam_t_old = self.lam_c_old = self.lam_s_old = 0.0
-        self.eps_p_n_old = self.eps_p_23_old = self.eps_p_13_old = 0.0
+        self.eps_p_n_old = 0.0
+        self.gamma_p_23_old = 0.0
+        self.gamma_p_13_old = 0.0
         self.W_pl_t_old = self.W_pl_c_old = self.W_pl_s_old = 0.0
-        self.D_n_old = self.D_s_old = 0.0
+        self.D_nt_old = self.D_nc_old = self.D_s_old = 0.0
         self.stress_old = np.zeros(6)
         self.strain_old = np.zeros(6)
-
         self.stress = np.zeros(6)
         self.strain = np.zeros(6)
-
         self._reset_trial()
 
     def _reset_trial(self):
@@ -1059,15 +1977,18 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         self.lam_c_trial = self.lam_c_old
         self.lam_s_trial = self.lam_s_old
         self.eps_p_n_trial = self.eps_p_n_old
-        self.eps_p_23_trial = self.eps_p_23_old
-        self.eps_p_13_trial = self.eps_p_13_old
+        self.gamma_p_23_trial = self.gamma_p_23_old
+        self.gamma_p_13_trial = self.gamma_p_13_old
         self.W_pl_t_trial = self.W_pl_t_old
         self.W_pl_c_trial = self.W_pl_c_old
         self.W_pl_s_trial = self.W_pl_s_old
-        self.D_n_trial = self.D_n_old
+        self.D_nt_trial = self.D_nt_old
+        self.D_nc_trial = self.D_nc_old
         self.D_s_trial = self.D_s_old
 
-    def _build_isotropic_stiffness(self, E, nu):
+    # ===================== УПРУГОСТЬ И ПОВОРОТЫ =====================
+
+    def _build_isotropic_stiffness_voigt(self, E, nu):
         D = np.zeros((6, 6))
         c1 = E * (1.0 - nu) / ((1.0 + nu) * (1.0 - 2.0 * nu))
         c2 = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
@@ -1083,6 +2004,8 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         if abs(nz[2]) > 0.999:
             nx = np.array([1.0, 0.0, 0.0])
             ny = np.cross(nz, nx)
+            ny /= np.linalg.norm(ny)
+            nx = np.cross(ny, nz)
         else:
             ny = np.cross(nz, [0.0, 0.0, 1.0])
             ny /= np.linalg.norm(ny)
@@ -1090,299 +2013,622 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         nx /= np.linalg.norm(nx)
         return np.column_stack((nx, ny, nz))
 
-    def _build_voigt_transformations(self, R):
-        """
-        ИСПРАВЛЕНО: Строгое построение матриц трансформации Фойгта.
-        sig_global = T_sig^T * sig_local
-        eps_local = T_eps * eps_global
-        """
+    def _build_voigt_transformation_matrices(self, R):
+        Q = R.T
         T_sig = np.zeros((6, 6))
         for i in range(3):
-            for j in range(3): T_sig[i, j] = R[i, j] ** 2
+            for j in range(3):
+                T_sig[i, j] = Q[i, j] ** 2
+        T_sig[0, 3] = 2 * Q[0, 0] * Q[0, 1];
+        T_sig[0, 4] = 2 * Q[0, 1] * Q[0, 2];
+        T_sig[0, 5] = 2 * Q[0, 0] * Q[0, 2]
+        T_sig[1, 3] = 2 * Q[1, 0] * Q[1, 1];
+        T_sig[1, 4] = 2 * Q[1, 1] * Q[1, 2];
+        T_sig[1, 5] = 2 * Q[1, 0] * Q[1, 2]
+        T_sig[2, 3] = 2 * Q[2, 0] * Q[2, 1];
+        T_sig[2, 4] = 2 * Q[2, 1] * Q[2, 2];
+        T_sig[2, 5] = 2 * Q[2, 0] * Q[2, 2]
+        T_sig[3, 0] = Q[0, 0] * Q[1, 0];
+        T_sig[3, 1] = Q[0, 1] * Q[1, 1];
+        T_sig[3, 2] = Q[0, 2] * Q[1, 2]
+        T_sig[4, 0] = Q[1, 0] * Q[2, 0];
+        T_sig[4, 1] = Q[1, 1] * Q[2, 1];
+        T_sig[4, 2] = Q[1, 2] * Q[2, 2]
+        T_sig[5, 0] = Q[0, 0] * Q[2, 0];
+        T_sig[5, 1] = Q[0, 1] * Q[2, 1];
+        T_sig[5, 2] = Q[0, 2] * Q[2, 2]
+        T_sig[3, 3] = Q[0, 0] * Q[1, 1] + Q[0, 1] * Q[1, 0]
+        T_sig[3, 4] = Q[0, 1] * Q[1, 2] + Q[0, 2] * Q[1, 1]
+        T_sig[3, 5] = Q[0, 0] * Q[1, 2] + Q[0, 2] * Q[1, 0]
+        T_sig[4, 3] = Q[1, 0] * Q[2, 1] + Q[1, 1] * Q[2, 0]
+        T_sig[4, 4] = Q[1, 1] * Q[2, 2] + Q[1, 2] * Q[2, 1]
+        T_sig[4, 5] = Q[1, 0] * Q[2, 2] + Q[1, 2] * Q[2, 0]
+        T_sig[5, 3] = Q[0, 0] * Q[2, 1] + Q[0, 1] * Q[2, 0]
+        T_sig[5, 4] = Q[0, 1] * Q[2, 2] + Q[0, 2] * Q[2, 1]
+        T_sig[5, 5] = Q[0, 0] * Q[2, 2] + Q[0, 2] * Q[2, 0]
 
-        T_sig[0, 3] = 2 * R[0, 0] * R[0, 1];
-        T_sig[0, 4] = 2 * R[0, 1] * R[0, 2];
-        T_sig[0, 5] = 2 * R[0, 0] * R[0, 2]
-        T_sig[1, 3] = 2 * R[1, 0] * R[1, 1];
-        T_sig[1, 4] = 2 * R[1, 1] * R[1, 2];
-        T_sig[1, 5] = 2 * R[1, 0] * R[1, 2]
-        T_sig[2, 3] = 2 * R[2, 0] * R[2, 1];
-        T_sig[2, 4] = 2 * R[2, 1] * R[2, 2];
-        T_sig[2, 5] = 2 * R[2, 0] * R[2, 2]
-
-        T_sig[3, 0] = R[0, 0] * R[1, 0];
-        T_sig[3, 1] = R[0, 1] * R[1, 1];
-        T_sig[3, 2] = R[0, 2] * R[1, 2]
-        T_sig[4, 0] = R[1, 0] * R[2, 0];
-        T_sig[4, 1] = R[1, 1] * R[2, 1];
-        T_sig[4, 2] = R[1, 2] * R[2, 2]
-        T_sig[5, 0] = R[0, 0] * R[2, 0];
-        T_sig[5, 1] = R[0, 1] * R[2, 1];
-        T_sig[5, 2] = R[0, 2] * R[2, 2]
-
-        T_sig[3, 3] = R[0, 0] * R[1, 1] + R[0, 1] * R[1, 0]
-        T_sig[3, 4] = R[0, 1] * R[1, 2] + R[0, 2] * R[1, 1]
-        T_sig[3, 5] = R[0, 0] * R[1, 2] + R[0, 2] * R[1, 0]
-
-        T_sig[4, 3] = R[1, 0] * R[2, 1] + R[1, 1] * R[2, 0]
-        T_sig[4, 4] = R[1, 1] * R[2, 2] + R[1, 2] * R[2, 1]
-        T_sig[4, 5] = R[1, 0] * R[2, 2] + R[1, 2] * R[2, 0]
-
-        T_sig[5, 3] = R[0, 0] * R[2, 1] + R[0, 1] * R[2, 0]
-        T_sig[5, 4] = R[0, 1] * R[2, 2] + R[0, 2] * R[2, 1]
-        T_sig[5, 5] = R[0, 0] * R[2, 2] + R[0, 2] * R[2, 0]
-
-        T_eps = np.zeros((6, 6))
-        T_eps[0:3, 0:3] = T_sig[0:3, 0:3]
-        T_eps[0:3, 3:6] = T_sig[0:3, 3:6] / 2.0
-        T_eps[3:6, 0:3] = T_sig[3:6, 0:3] * 2.0
-        T_eps[3:6, 3:6] = T_sig[3:6, 3:6]
-
+        N = np.diag([1.0, 1.0, 1.0, 2.0, 2.0, 2.0])
+        N_inv = np.diag([1.0, 1.0, 1.0, 0.5, 0.5, 0.5])
+        T_eps = N @ T_sig @ N_inv
         return T_sig, T_eps
 
+    # ============================ LOCKING ============================
+
     def _lock_plane(self, normal, stress_tensor):
+        print(f'Locked critical plane with normal: {normal}')
         self.fixed_normal = normal
         self.R = self._build_rotation_matrix(normal)
-        self.T_sig, self.T_eps = self._build_voigt_transformations(self.R)
+        self.T_sig, self.T_eps = self._build_voigt_transformation_matrices(self.R)
 
-        # Перевод матрицы жесткости в локальные оси трещины (ось Z - нормаль)
-        self.D_local = self.T_sig @ self.D_rock @ self.T_eps.T
+        self.D_local = self.T_sig @ self.D_rock @ self.T_sig.T
         self.E_n = self.D_local[2, 2]
         self.G_s = self.D_local[4, 4]
 
-        self.f_t = get_tensile_limit(normal, self.cp_material)
-        self.f_c = get_compression_limit(normal, self.cp_material)
-        self.c = get_cohesion_limit(normal, stress_tensor, self.cp_material)
+        self.f_t = max(get_tensile_limit(normal, self.cp_material), 1e-12)
+        self.f_c = max(get_compression_limit(normal, self.cp_material), 1e-12)
+        self.c = max(get_cohesion_limit(normal, stress_tensor, self.cp_material), 1e-12)
 
-        eps_f_t = 3.0 * self.Gf_t / self.f_t if self.f_t > 0 else 1e-6
-        self.H_t = -self.f_t / eps_f_t if eps_f_t > 0 else 0.0
+        denom = (1.0 + self.f_t ** 2 / (3.0 * self.E_n * self.Gf_t)) * self.mu - 1.0
+        self.H_t = abs(self.E_n / denom) if denom != 0 else 0.0
 
-        eps_f_c = 2.0 * self.Gf_c / self.f_c if self.f_c > 0 else 1e-6
-        self.H_c = -self.f_c / eps_f_c if eps_f_c > 0 else 0.0
+        if self.tan_phi < 1e-12:
+            self.q_lim = np.inf
+        else:
+            self.q_lim = self.c / self.tan_phi - self.f_t
 
-        gamma_f_s = 2.0 * self.Gf_s / max(self.c, 1e-6)
-        self.H_s = -self.c / gamma_f_s if gamma_f_s > 0 else 0.0
-
+        self.H_c = self.H_s = 0.0
         self.is_locked = True
 
-    def _integrate_stress(self, current_strain):
-        """
-        Чистая функция интегрирования напряжений.
-        Принимает деформации, возвращает напряжения. Никаких побочных эффектов на state.
-        """
-        d_strain = current_strain - self.strain_old
-        sig_tr_v = self.stress_old + self.D_rock @ d_strain
+    # ===================== ВСПОМОГАТЕЛЬНЫЕ =====================
 
-        if not self.is_locked:
-            return sig_tr_v
+    def _c_curr(self, q):
+        if q <= self.q_lim:
+            return self.c
+        return self.c + (q - self.q_lim) * self.tan_phi
 
-        # Перевод деформаций в локальные оси (T_eps)
-        e_l = self.T_eps @ current_strain
+    def _ft_curr(self, q):
+        return self.f_t + q
 
-        # Упругие предикторы
-        sig_n_tr = self.E_n * (e_l[2] - self.eps_p_n_old)
-        tau_23_tr = self.G_s * (e_l[4] - self.eps_p_23_old)
-        tau_13_tr = self.G_s * (e_l[5] - self.eps_p_13_old)
+    # ===================== NEWTON-RAPHSON RETURN MAPPING =====================
+
+    def _return_mapping_nr(self, sig_n_tr, tau_23_tr, tau_13_tr):
+        # (Код Newton-Raphson остается без изменений, как в вашем изначальном варианте)
+        tol = self.nr_tol
+        max_iter = self.nr_max_iter
+
+        q_old = self.H_t * self.lam_t_old
         tau_tr = np.sqrt(tau_23_tr ** 2 + tau_13_tr ** 2)
 
-        ft_curr = max(self.f_t + self.H_t * self.lam_t_old, 0.0)
-        fc_curr = max(self.f_c + self.H_c * self.lam_c_old, 0.1 * self.f_c)
-        c_curr = max(self.c + self.H_s * self.lam_s_old, 0.0)
+        ft_yld = self._ft_curr(q_old)
+        c_yld = self._c_curr(q_old)
 
-        f_t_val = sig_n_tr - ft_curr
-        f_c_val = -sig_n_tr - fc_curr
-        f_s_val = tau_tr + sig_n_tr * self.tan_phi - c_curr
+        f_t_tr = (sig_n_tr - ft_yld) if np.isfinite(ft_yld) else -1.0
+        f_c_tr = -sig_n_tr - self.f_c
+        f_s_tr = tau_tr + sig_n_tr * self.tan_phi - c_yld
 
-        d_lam_t = d_lam_c = d_lam_s = 0.0
+        tol_f_t = tol * max(self.f_t, 1.0)
+        tol_f_c = tol * max(self.f_c, 1.0)
+        tol_f_s = tol * max(self.c, 1.0)
 
-        if f_t_val > 0 and f_s_val > 0:
-            det = (self.E_n + self.H_t) * (self.G_s + self.E_n * self.tan_phi * self.tan_psi + self.H_s) - \
-                  (self.E_n * self.tan_psi) * (self.E_n * self.tan_phi)
-            d_lam_t = ((self.G_s + self.E_n * self.tan_phi * self.tan_psi + self.H_s) * f_t_val - \
-                       (self.E_n * self.tan_psi) * f_s_val) / det
-            d_lam_s = (-(self.E_n * self.tan_phi) * f_t_val + (self.E_n + self.H_t) * f_s_val) / det
-            if d_lam_t <= 0:
-                d_lam_t = 0;
-                d_lam_s = f_s_val / (self.G_s + self.E_n * self.tan_phi * self.tan_psi + self.H_s)
-            elif d_lam_s <= 0:
-                d_lam_s = 0;
-                d_lam_t = f_t_val / (self.E_n + self.H_t)
+        if f_t_tr <= tol_f_t and f_c_tr <= tol_f_c and f_s_tr <= tol_f_s:
+            return sig_n_tr, tau_23_tr, tau_13_tr, 0.0, 0.0, 0.0, None, (False, False, False)
 
-        elif f_c_val > 0 and f_s_val > 0:
-            det = (self.E_n + self.H_c) * (self.G_s - self.E_n * self.tan_phi * self.tan_psi + self.H_s) + \
-                  (self.E_n * self.tan_psi) * (self.E_n * self.tan_phi)
-            d_lam_c = ((self.G_s - self.E_n * self.tan_phi * self.tan_psi + self.H_s) * f_c_val + \
-                       (self.E_n * self.tan_psi) * f_s_val) / det
-            d_lam_s = (-(self.E_n * self.tan_phi) * f_c_val + (self.E_n + self.H_c) * f_s_val) / det
-            if d_lam_c <= 0:
-                d_lam_c = 0;
-                d_lam_s = f_s_val / (self.G_s + self.E_n * self.tan_phi * self.tan_psi + self.H_s)
-            elif d_lam_s <= 0:
-                d_lam_s = 0;
-                d_lam_c = f_c_val / (self.E_n + self.H_c)
+        act_t = f_t_tr > tol_f_t and np.isfinite(ft_yld)
+        act_c = f_c_tr > tol_f_c and not act_t
+        sn_proj = ft_yld if act_t else (-self.f_c if act_c else sig_n_tr)
+        act_s = (tau_tr + sn_proj * self.tan_phi - c_yld) > tol_f_s
 
-        elif f_t_val > 0:
-            d_lam_t = f_t_val / (self.E_n + self.H_t)
-        elif f_c_val > 0:
-            d_lam_c = f_c_val / (self.E_n + self.H_c)
-        elif f_s_val > 0:
-            d_lam_s = f_s_val / (self.G_s + self.E_n * self.tan_phi * self.tan_psi + self.H_s)
+        scale_nr = max(self.E_n, self.G_s, 1.0)
+        max_dlam = ((abs(sig_n_tr) + tau_tr + max(self.f_t, self.f_c, self.c)) / min(self.E_n, self.G_s)) * 1000.0
+        nr_abs_tol = tol * max(self.f_t, self.f_c, self.c, abs(sig_n_tr), tau_tr, 1.0) * 1e4
 
-        # Эффективные напряжения
-        sig_n = sig_n_tr - self.E_n * (d_lam_t - d_lam_c + d_lam_s * self.tan_psi)
-        tau = max(tau_tr - self.G_s * d_lam_s, 0.0)
+        def _nr_solve(act_t, act_c, act_s):
+            col_t = 3 if act_t else None
+            col_c = (3 + int(act_t)) if act_c else None
+            col_s = (3 + int(act_t) + int(act_c)) if act_s else None
+            n = 3 + int(act_t) + int(act_c) + int(act_s)
 
-        shear_ratio = tau / tau_tr if tau_tr > 1e-12 else 0.0
-        tau_23 = tau_23_tr * shear_ratio
-        tau_13 = tau_13_tr * shear_ratio
+            x = np.zeros(n)
+            x[0], x[1], x[2] = sig_n_tr, tau_23_tr, tau_13_tr
+            R_vec = np.zeros(n)
+            J = np.zeros((n, n))
 
-        # Обновление Damage
-        W_pl_t = self.W_pl_t_old + (sig_n * d_lam_t if d_lam_t > 0 else 0)
-        W_pl_c = self.W_pl_c_old + (abs(sig_n) * d_lam_c if d_lam_c > 0 else 0)
-        W_pl_s = self.W_pl_s_old + (tau * d_lam_s if d_lam_s > 0 else 0)
+            converged = False
+            for _ in range(max_iter):
+                sn_i = x[0];
+                t23_i = x[1];
+                t13_i = x[2]
+                dlt_i = x[col_t] if act_t else 0.0
+                dlc_i = x[col_c] if act_c else 0.0
+                dls_i = x[col_s] if act_s else 0.0
+
+                tau_i = np.sqrt(t23_i ** 2 + t13_i ** 2)
+                tau_si = max(tau_i, 1e-14)
+                n23_i = t23_i / tau_si
+                n13_i = t13_i / tau_si
+
+                q_i = self.H_t * (self.lam_t_old + max(dlt_i, 0.0))
+                ft_i = self._ft_curr(q_i)
+                c_i = self._c_curr(q_i)
+
+                R_vec = np.zeros(n)
+                R_vec[0] = sn_i - sig_n_tr + self.E_n * (dlt_i - dlc_i + dls_i * self.tan_psi)
+                R_vec[1] = t23_i - tau_23_tr + self.G_s * dls_i * n23_i
+                R_vec[2] = t13_i - tau_13_tr + self.G_s * dls_i * n13_i
+                row = 3
+                if act_t: R_vec[row] = sn_i - (ft_i if np.isfinite(ft_i) else 1e30); row += 1
+                if act_c: R_vec[row] = -sn_i - self.f_c; row += 1
+                if act_s: R_vec[row] = tau_i + sn_i * self.tan_phi - c_i; row += 1
+
+                if np.linalg.norm(R_vec) / scale_nr < tol:
+                    converged = True
+                    break
+
+                J = np.zeros((n, n))
+                J[0, 0] = 1.0
+                if tau_si > 1e-10:
+                    J[1, 1] = 1.0 + self.G_s * dls_i * n13_i ** 2 / tau_si
+                    J[1, 2] = -self.G_s * dls_i * n23_i * n13_i / tau_si
+                    J[2, 1] = J[1, 2]
+                    J[2, 2] = 1.0 + self.G_s * dls_i * n23_i ** 2 / tau_si
+                else:
+                    J[1, 1] = 1.0;
+                    J[2, 2] = 1.0
+
+                if act_t: J[0, col_t] = self.E_n
+                if act_c: J[0, col_c] = -self.E_n
+                if act_s:
+                    J[0, col_s] = self.E_n * self.tan_psi
+                    if tau_si > 1e-10:
+                        J[1, col_s] = self.G_s * n23_i
+                        J[2, col_s] = self.G_s * n13_i
+
+                row = 3
+                if act_t:
+                    J[row, 0] = 1.0;
+                    J[row, col_t] = -self.H_t;
+                    row += 1
+                if act_c:
+                    J[row, 0] = -1.0;
+                    row += 1
+                if act_s:
+                    J[row, 0] = self.tan_phi
+                    if tau_si > 1e-10:
+                        J[row, 1] = n23_i;
+                        J[row, 2] = n13_i
+                    if act_t and q_i > self.q_lim:
+                        J[row, col_t] = -self.H_t * self.tan_phi
+                    row += 1
+
+                try:
+                    x -= np.linalg.solve(J, R_vec)
+                except np.linalg.LinAlgError:
+                    try:
+                        x -= np.linalg.pinv(J) @ R_vec
+                    except np.linalg.LinAlgError:
+                        break
+
+            converged = converged or (np.linalg.norm(R_vec) / scale_nr < tol * 1e5)
+
+            J_inv = None
+            if converged:
+                try:
+                    J_inv = np.linalg.inv(J)
+                except np.linalg.LinAlgError:
+                    try:
+                        J_inv = np.linalg.pinv(J)
+                    except np.linalg.LinAlgError:
+                        pass
+
+            return (x[0], x[1], x[2], x[col_t] if act_t else 0.0, x[col_c] if act_c else 0.0,
+                    x[col_s] if act_s else 0.0, converged, J_inv)
+
+        def _apex_solve():
+            if self.G_s < 1e-12: return 0, 0, 0, 0, 0, 0, False, None
+            dls = tau_tr / self.G_s
+            dlt = (sig_n_tr - self.E_n * dls * self.tan_psi - self.f_t - self.H_t * self.lam_t_old) / (
+                        self.E_n + self.H_t)
+            if dlt < -1e-6: return 0, 0, 0, 0, 0, 0, False, None
+            dlt = max(dlt, 0.0)
+            sn = self.f_t + self.H_t * (self.lam_t_old + dlt)
+
+            J = np.zeros((5, 5))
+            J[0, 0] = 1.0;
+            J[0, 3] = self.E_n;
+            J[0, 4] = self.E_n * self.tan_psi
+            J[1, 1] = 1.0;
+            J[2, 2] = 1.0
+            if tau_tr > 1e-14:
+                J[1, 4] = self.G_s * (tau_23_tr / tau_tr)
+                J[2, 4] = self.G_s * (tau_13_tr / tau_tr)
+            J[3, 0] = 1.0;
+            J[3, 3] = -self.H_t
+
+            if tau_tr > 1e-14:
+                J[4, 1] = tau_23_tr / tau_tr
+                J[4, 2] = tau_13_tr / tau_tr
+            else:
+                J[4, 1] = 1.0
+            J[4, 4] = self.G_s
+
+            try:
+                J_inv = np.linalg.inv(J)
+            except np.linalg.LinAlgError:
+                J_inv = np.linalg.pinv(J)
+
+            return sn, 0.0, 0.0, dlt, 0.0, dls, True, J_inv
+
+        def _is_valid(sn, t23, t13, dl_t):
+            tau = np.sqrt(t23 ** 2 + t13 ** 2)
+            q = self.H_t * (self.lam_t_old + max(dl_t, 0.0))
+            ft_v = self._ft_curr(q)
+            return ((sn - ft_v) <= nr_abs_tol and
+                    -sn - self.f_c <= nr_abs_tol and
+                    tau + sn * self.tan_phi - self._c_curr(q) <= nr_abs_tol)
+
+        def _check_multipliers(act_t, act_c, act_s, dlt, dlc, dls):
+            tol_lam = 1e-7 + 1e-5 * max_dlam
+            if act_t and (dlt < -tol_lam or dlt > max_dlam): return False
+            if act_c and (dlc < -tol_lam or dlc > max_dlam): return False
+            if act_s and (dls < -tol_lam or dls > max_dlam): return False
+            return True
+
+        def _eval_error(sn, t23, t13, dlt, dlc, dls):
+            tau = np.sqrt(t23 ** 2 + t13 ** 2)
+            q = self.H_t * (self.lam_t_old + max(dlt, 0.0))
+            err = 0.0
+            if dlt < 0: err += abs(dlt) * self.E_n
+            if dlc < 0: err += abs(dlc) * self.E_n
+            if dls < 0: err += abs(dls) * self.G_s
+            ft_v = self._ft_curr(q)
+            if sn - ft_v > 0: err += sn - ft_v
+            if -sn - self.f_c > 0: err += -sn - self.f_c
+            f_s = tau + sn * self.tan_phi - self._c_curr(q)
+            if f_s > 0: err += f_s
+            return err
+
+        best_sol = None
+        best_err = np.inf
+
+        def _update_best(sn, t23, t13, dlt, dlc, dls, J_inv, flags):
+            nonlocal best_sol, best_err
+            err = _eval_error(sn, t23, t13, dlt, dlc, dls)
+            if err < best_err:
+                best_err = err
+                best_sol = (sn, t23, t13, max(dlt, 0.0), max(dlc, 0.0), max(dls, 0.0), J_inv, flags)
+
+        # 1. Попытка основного предсказания
+        sig_n, tau_23, tau_13, d_lam_t, d_lam_c, d_lam_s, conv, J_inv = _nr_solve(act_t, act_c, act_s)
+        if conv:
+            _update_best(sig_n, tau_23, tau_13, d_lam_t, d_lam_c, d_lam_s, J_inv, (act_t, act_c, act_s))
+            if _check_multipliers(act_t, act_c, act_s, d_lam_t, d_lam_c, d_lam_s) and _is_valid(sig_n, tau_23, tau_13,
+                                                                                                d_lam_t):
+                return sig_n, tau_23, tau_13, max(d_lam_t, 0.0), max(d_lam_c, 0.0), max(d_lam_s, 0.0), J_inv, (act_t,
+                                                                                                               act_c,
+                                                                                                               act_s)
+
+        # 2. Перебор всех комбинаций
+        combinations = [
+            (True, False, True), (False, True, True), (True, False, False),
+            (False, True, False), (False, False, True), ("APEX", False, False)
+        ]
+
+        for test_t, test_c, test_s in combinations:
+            if test_t == "APEX":
+                sn, t23, t13, dlt, dlc, dls, conv, J_inv = _apex_solve()
+                if conv:
+                    q_i = self.H_t * (self.lam_t_old + dlt)
+                    if (sn * self.tan_phi - self._c_curr(q_i)) < -nr_abs_tol:
+                        conv = False
+            else:
+                sn, t23, t13, dlt, dlc, dls, conv, J_inv = _nr_solve(test_t, test_c, test_s)
+
+            if not conv: continue
+
+            check_t = True if test_t == "APEX" else test_t
+            check_s = True if test_t == "APEX" else test_s
+
+            _update_best(sn, t23, t13, dlt, dlc, dls, J_inv, (check_t, test_c, check_s))
+
+            if not _check_multipliers(check_t, test_c, check_s, dlt, dlc, dls): continue
+            if _is_valid(sn, t23, t13, dlt):
+                return sn, t23, t13, max(dlt, 0.0), max(dlc, 0.0), max(dls, 0.0), J_inv, (check_t, test_c, check_s)
+
+        # 3. Fallback
+        if best_sol is not None:
+            return best_sol
+
+        return sig_n_tr, tau_23_tr, tau_13_tr, 0.0, 0.0, 0.0, None, (False, False, False)
+
+    # ===================== ИНТЕГРАЦИЯ НАПРЯЖЕНИЙ =====================
+
+    def _integrate_stress(self, current_strain, update_history=False):
+        if not self.is_locked:
+            self._last_J_inv = None
+            self._last_active_flags = (False, False, False)
+            return self.stress_old + self.D_rock @ (current_strain - self.strain_old)
+
+        e_l = self.T_eps @ current_strain
+        e_l_eff = e_l.copy()
+        e_l_eff[2] -= self.eps_p_n_old
+        e_l_eff[4] -= self.gamma_p_23_old
+        e_l_eff[5] -= self.gamma_p_13_old
+
+        sig_l_tr = self.D_local @ e_l_eff
+        sig_n_tr = sig_l_tr[2]
+        tau_23_tr = sig_l_tr[4]
+        tau_13_tr = sig_l_tr[5]
+
+        sig_n, tau_23, tau_13, d_lam_t, d_lam_c, d_lam_s, J_inv, active_flags = \
+            self._return_mapping_nr(sig_n_tr, tau_23_tr, tau_13_tr)
+
+        tau = np.sqrt(tau_23 ** 2 + tau_13 ** 2)
+        d_eps_p_n = d_lam_t - d_lam_c + d_lam_s * self.tan_psi
+
+        lam_t_new = self.lam_t_old + d_lam_t
+        q_new = self.H_t * lam_t_new
+
+        dW_t = max(sig_n * d_lam_t, 0.0) if d_lam_t > 0 else 0.0
+        dW_c = max(abs(sig_n) * d_lam_c, 0.0) if d_lam_c > 0 else 0.0
+        dW_s = max((tau + sig_n * self.tan_psi) * d_lam_s, 0.0) if d_lam_s > 0 else 0.0
+
+        W_pl_t = self.W_pl_t_old + dW_t
+        W_pl_c = self.W_pl_c_old + dW_c
+        W_pl_s = self.W_pl_s_old + dW_s
 
         r_t = min(W_pl_t / self.Gf_t, 1.0)
         r_c = min(W_pl_c / self.Gf_c, 1.0)
-        D_n_new = max(r_t * (2.0 - r_t), 0.5 * np.sin(np.pi * r_c - np.pi / 2.0) + 0.5)
-        D_n = min(max(D_n_new, self.D_n_old), 0.999)
-
         r_s = min(W_pl_s / self.Gf_s, 1.0)
-        D_s = min(max(r_s * (2.0 - r_s), self.D_s_old), 0.999)
 
-        # Собираем локальные напряжения
+        Fp_t = r_t * (2.0 - r_t)
+        Fp_c = 0.5 * (np.sin(np.pi * r_c - 0.5 * np.pi) + 1.0)
+        Fp_s = r_s * (2.0 - r_s)
+
+        dt = Fp_t + self.a_t * Fp_s * (1.0 - Fp_t)
+        D_nt_new = 1.0 - (1.0 - dt) * self.f_t / (self.f_t + q_new + 1e-12)
+        D_nc_new = (1.0 - self.fcr_over_fc) * Fp_c
+
+        ds_base = min(max(self.a_s * Fp_t * (1 - Fp_s) * (1 - Fp_c) + Fp_s + Fp_c - Fp_s * Fp_c, 0.0), 1.0)
+
+        if sig_n < 0.0:
+            abs_sn = -sig_n
+            D_s_new = ds_base * (self.c + abs_sn * (self.tan_phi - self.tan_phi_r)) / (
+                        self.c + abs_sn * self.tan_phi + 1e-12)
+        else:
+            D_s_new = ds_base
+
+        D_nt = min(max(D_nt_new, self.D_nt_old), 0.99)
+        D_nc = min(max(D_nc_new, self.D_nc_old), 0.99)
+        D_s = min(max(D_s_new, self.D_s_old), 0.99)
+
         sig_l = self.D_local @ e_l
-        sig_l[2] = (1.0 - D_n) * sig_n
+        sig_l[2] = (1.0 - D_nt) * sig_n if sig_n >= 0.0 else (1.0 - D_nc) * sig_n
         sig_l[4] = (1.0 - D_s) * tau_23
         sig_l[5] = (1.0 - D_s) * tau_13
 
-        # Возвращаем глобальные напряжения (T_sig^T)
-        return self.T_sig.T @ sig_l
+        if update_history:
+            self.lam_t_trial = lam_t_new
+            self.lam_c_trial = self.lam_c_old + d_lam_c
+            self.lam_s_trial = self.lam_s_old + d_lam_s
+            self.eps_p_n_trial = self.eps_p_n_old + d_eps_p_n
+            tau_safe = max(tau, 1e-14)
+            if d_lam_s > 0.0:
+                self.gamma_p_23_trial = self.gamma_p_23_old + d_lam_s * (tau_23 / tau_safe)
+                self.gamma_p_13_trial = self.gamma_p_13_old + d_lam_s * (tau_13 / tau_safe)
+            self.W_pl_t_trial = W_pl_t
+            self.W_pl_c_trial = W_pl_c
+            self.W_pl_s_trial = W_pl_s
+            self.D_nt_trial = D_nt
+            self.D_nc_trial = D_nc
+            self.D_s_trial = D_s
 
-    def _compute_numerical_tangent(self, current_strain, eps=1e-8):
-        """
-        ВЫЧИСЛЕНИЕ ЧИСЛЕННОГО ЯКОБИАНА (ТОЧНЫЙ CTO)
-        Гарантирует квадратичную сходимость Ньютона-Рафсона.
-        D_ij = d(sigma_i) / d(eps_j)
-        """
+            self._last_J_inv = J_inv
+            self._last_active_flags = active_flags
+            self._last_sig_eff = np.array([sig_n, tau_23, tau_13])
+            self._last_d_lams = np.array([d_lam_t, d_lam_c, d_lam_s])
+            self._last_W_pls = np.array([W_pl_t, W_pl_c, W_pl_s])
+            self._last_q_new = q_new
+
+        return self.T_eps.T @ sig_l
+
+    # ===================== АНАЛИТИЧЕСКИЙ КАСАТЕЛЬНЫЙ МОДУЛЬ =====================
+
+    def _compute_analytical_tangent(self):
+        # (Код analytical tangent остается без изменений)
+        J_inv = self._last_J_inv
+        if J_inv is None:
+            return None
+
+        act_t, act_c, act_s = self._last_active_flags
+        sig_eff = self._last_sig_eff
+        d_lams = self._last_d_lams
+        W_pls = self._last_W_pls
+        q_new = self._last_q_new
+
+        col_t = 3 if act_t else None
+        col_c = (3 + int(act_t)) if act_c else None
+        col_s = (3 + int(act_t) + int(act_c)) if act_s else None
+
+        D_e_loc = np.diag([self.E_n, self.G_s, self.G_s])
+        tau_eff = np.sqrt(sig_eff[1] ** 2 + sig_eff[2] ** 2)
+
+        D_ep_loc = J_inv[0:3, 0:3] @ D_e_loc
+
+        d_lam_deps = np.zeros((3, 3))
+        if act_t: d_lam_deps[0, :] = J_inv[col_t, 0:3] @ D_e_loc
+        if act_c: d_lam_deps[1, :] = J_inv[col_c, 0:3] @ D_e_loc
+        if act_s: d_lam_deps[2, :] = J_inv[col_s, 0:3] @ D_e_loc
+
+        dW_deps = np.zeros((3, 3))
+        if act_t and d_lams[0] > 0:
+            dW_deps[0, :] = d_lams[0] * D_ep_loc[0, :] + sig_eff[0] * d_lam_deps[0, :]
+        if act_c and d_lams[1] > 0:
+            sign_c = -1.0 if sig_eff[0] < 0 else 1.0
+            dW_deps[1, :] = d_lams[1] * sign_c * D_ep_loc[0, :] + abs(sig_eff[0]) * d_lam_deps[1, :]
+        if act_s and d_lams[2] > 0:
+            dtau_dsig = np.array([0.0, sig_eff[1] / max(tau_eff, 1e-14), sig_eff[2] / max(tau_eff, 1e-14)])
+            term1 = dtau_dsig @ D_ep_loc + self.tan_psi * D_ep_loc[0, :]
+            dW_deps[2, :] = d_lams[2] * term1 + (tau_eff + sig_eff[0] * self.tan_psi) * d_lam_deps[2, :]
+
+        r_t = W_pls[0] / self.Gf_t
+        dFpt_dWt = (2.0 - 2.0 * r_t) / self.Gf_t if r_t < 1.0 else 0.0
+        Fpt = r_t * (2.0 - r_t) if r_t < 1.0 else 1.0
+
+        r_c = W_pls[1] / self.Gf_c
+        dFpc_dWc = 0.5 * np.pi * np.cos(np.pi * r_c - 0.5 * np.pi) / self.Gf_c if r_c < 1.0 else 0.0
+        Fpc = 0.5 * (np.sin(np.pi * r_c - 0.5 * np.pi) + 1.0) if r_c < 1.0 else 1.0
+
+        r_s = W_pls[2] / self.Gf_s
+        dFps_dWs = (2.0 - 2.0 * r_s) / self.Gf_s if r_s < 1.0 else 0.0
+        Fps = r_s * (2.0 - r_s) if r_s < 1.0 else 1.0
+
+        dt = Fpt + self.a_t * Fps * (1.0 - Fpt)
+        ddt_dWt = (1.0 - self.a_t * Fps) * dFpt_dWt
+        ddt_dWs = self.a_t * (1.0 - Fpt) * dFps_dWs
+
+        denom_t = self.f_t + q_new + 1e-12
+        dDnt_ddt = self.f_t / denom_t
+        dDnt_dlamt = (1.0 - dt) * self.f_t * self.H_t / (denom_t ** 2)
+        dDnt_deps = dDnt_ddt * (ddt_dWt * dW_deps[0, :] + ddt_dWs * dW_deps[2, :]) + dDnt_dlamt * d_lam_deps[0, :]
+
+        dDnc_deps = (1.0 - self.fcr_over_fc) * dFpc_dWc * dW_deps[1, :]
+        Dnc_val = (1.0 - self.fcr_over_fc) * Fpc
+
+        ddsbase_dWt = self.a_s * (1.0 - Fps) * (1.0 - Fpc) * dFpt_dWt
+        ddsbase_dWc = (-self.a_s * Fpt * (1.0 - Fps) + 1.0 - Fps) * dFpc_dWc
+        ddsbase_dWs = (-self.a_s * Fpt * (1.0 - Fpc) + 1.0 - Fpc) * dFps_dWs
+        dDsbase_deps = ddsbase_dWt * dW_deps[0, :] + ddsbase_dWc * dW_deps[1, :] + ddsbase_dWs * dW_deps[2, :]
+        ds_base = min(max(self.a_s * Fpt * (1 - Fps) * (1 - Fpc) + Fps + Fpc - Fps * Fpc, 0.0), 1.0)
+
+        if sig_eff[0] < 0.0:
+            x = -(1.0 - Dnc_val) * sig_eff[0]
+            denom_s = self.c + x * self.tan_phi + 1e-12
+            K_fric = (self.c + x * (self.tan_phi - self.tan_phi_r)) / denom_s
+            dK_dx = -self.c * self.tan_phi_r / (denom_s ** 2)
+            dx_dsign = -(1.0 - Dnc_val)
+            dx_dDnc = sig_eff[0]
+            dK_deps = dK_dx * (dx_dsign * D_ep_loc[0, :] + dx_dDnc * dDnc_deps)
+            dDs_deps = dDsbase_deps * K_fric + ds_base * dK_deps
+            D_s_new = ds_base * K_fric
+        else:
+            dDs_deps = dDsbase_deps
+            D_s_new = ds_base
+
+        D_nt_new = 1.0 - (1.0 - dt) * self.f_t / denom_t
+        if D_nt_new > 0.899 or D_nt_new < self.D_nt_old: dDnt_deps *= 0.0
+        if Dnc_val > 0.899 or Dnc_val < self.D_nc_old: dDnc_deps *= 0.0
+        if D_s_new > 0.899 or D_s_new < self.D_s_old: dDs_deps *= 0.0
+
+        D_nt = min(max(D_nt_new, self.D_nt_old), 0.899)
+        D_nc = min(max(Dnc_val, self.D_nc_old), 0.899)
+        D_s = min(max(D_s_new, self.D_s_old), 0.899)
+
+        K_loc = np.zeros((3, 3))
+        D_n = D_nt if sig_eff[0] >= 0.0 else D_nc
+        dDn_deps = dDnt_deps if sig_eff[0] >= 0.0 else dDnc_deps
+
+        K_loc[0, :] = (1.0 - D_n) * D_ep_loc[0, :] - sig_eff[0] * dDn_deps
+        K_loc[1, :] = (1.0 - D_s) * D_ep_loc[1, :] - sig_eff[1] * dDs_deps
+        K_loc[2, :] = (1.0 - D_s) * D_ep_loc[2, :] - sig_eff[2] * dDs_deps
+
+        K_loc_6x6 = self.D_local.copy()
+        idx = [2, 4, 5]
+        for i in range(3):
+            for j in range(3):
+                K_loc_6x6[idx[i], idx[j]] = K_loc[i, j]
+
+        return self.T_eps.T @ K_loc_6x6 @ self.T_eps
+
+    def _compute_numerical_tangent(self, current_strain, eps=1e-7):
         D_num = np.zeros((6, 6))
-        stress_base = self._integrate_stress(current_strain)
-
+        scale = max(np.linalg.norm(current_strain), 1.0)
+        h = eps * scale
         for j in range(6):
-            strain_pert = current_strain.copy()
-            strain_pert[j] += eps
-            stress_pert = self._integrate_stress(strain_pert)
-            D_num[:, j] = (stress_pert - stress_base) / eps
-
-        # Симметризация малой численной асимметрии (по желанию, для неассоциированного течения матрица несимметрична!)
+            ep = current_strain.copy();
+            ep[j] += h
+            em = current_strain.copy();
+            em[j] -= h
+            D_num[:, j] = (self._integrate_stress(ep, update_history=False)
+                           - self._integrate_stress(em, update_history=False)) / (2.0 * h)
         return D_num
 
-    def update_state(self, current_strain):
+    # ===================== ГЛАВНЫЙ ВХОД (ОБНОВЛЕНО) =====================
+
+    def update_state(self, current_strain_voigt):
+        current_strain = current_strain_voigt.copy()
         self.strain = current_strain
         self._reset_trial()
 
-        # 1. Поиск критической плоскости
         if not self.is_locked:
-            sig_tr_v = self.stress_old + self.D_rock @ (current_strain - self.strain_old)
-            st = StressTensor(sig_tr_v[0], sig_tr_v[1], sig_tr_v[2], sig_tr_v[3], sig_tr_v[4], sig_tr_v[5])
-            f_t_scaled, n_t, _ = find_critical_plane_tensile(StressTensor(*(sig_tr_v / 0.8)), self.cp_material,
-                                                             mode='3D')
-            f_sh, n_sh, _ = find_critical_plane_shear(st, self.cp_material, mode='3D')
+            # Считаем пробные упругие напряжения
+            sig_tr = self.stress_old + self.D_rock @ (current_strain - self.strain_old)
+            st = StressTensor(*sig_tr)
 
-            if f_sh > 0 or f_t_scaled > 0:
-                f_t_real, _, _ = find_critical_plane_tensile(st, self.cp_material, mode='3D')
-                best_n = n_sh if (f_sh > f_t_real and f_sh > 0) else n_t
-                self._lock_plane(best_n, st)
+            # Ищем критические площадки по всем трем критериям
+            f_s, n_s, util_s = find_critical_plane_shear(st, self.cp_material, num_planes=self.cp_num_planes)
+            f_t, n_t, util_t = find_critical_plane_tensile(st, self.cp_material, num_planes=self.cp_num_planes)
+            f_c, n_c, util_c = find_critical_plane_compression(st, self.cp_material, num_planes=self.cp_num_planes)
+
+            max_f = max(f_s, f_t, f_c)
+
+            # Если включен режим фиксации только при пластичности и критерий еще не достигнут (f <= 0)
+            if self.lock_on_yield and max_f <= 1e-10:
+                # Шаг упругий, площадка пока не фиксируется
+                self.stress = sig_tr
+                self.D_tangent = self.D_rock.copy()
+                return self.stress.copy(), self.D_tangent
             else:
-                self.stress = sig_tr_v
-                self.D_tangent = self.D_rock
-                return self.stress, self.D_tangent
+                # Пластичность достигнута (или lock_on_yield = False).
+                # Выбираем площадку с максимальным коэффициентом использования (utilization)
+                max_util = max(util_s, util_t, util_c)
 
-        # 2. Интегрирование напряжений (Return Mapping)
-        self.stress = self._integrate_stress(current_strain)
+                if max_util == util_s:
+                    best_n = n_s
+                elif max_util == util_t:
+                    best_n = n_t
+                else:
+                    best_n = n_c
 
-        # 3. Вычисление точного касательного оператора
-        if self.tangent_type == 'numerical':
-            self.D_tangent = self._compute_numerical_tangent(current_strain)
-        else:
-            # Здесь можно оставить ваш аналитический метод, но численный надежнее
-            self.D_tangent = self._compute_numerical_tangent(current_strain)
+                self._lock_plane(best_n, st)
 
-        # Защита от нулей на диагонали
-        self.D_tangent += np.eye(6) * self.E_min
+        # Выполняем интегрирование напряжений с зафиксированной площадкой
+        self.stress = self._integrate_stress(current_strain, update_history=True)
 
-        # 4. Обновление trial переменных для коммита
-        # (Повторяем расчет, чтобы зафиксировать внутренние переменные)
-        e_l = self.T_eps @ current_strain
-        sig_n_tr = self.E_n * (e_l[2] - self.eps_p_n_old)
-        tau_23_tr = self.G_s * (e_l[4] - self.eps_p_23_old)
-        tau_13_tr = self.G_s * (e_l[5] - self.eps_p_13_old)
-        tau_tr = np.sqrt(tau_23_tr ** 2 + tau_13_tr ** 2)
+        # Пытаемся получить аналитическую матрицу
+        D_alg = None
+        if self.is_locked:
+            if self._last_active_flags == (False, False, False):
+                # Если новой пластики нет, матрица считается мгновенно
+                D_alg = self._compute_damaged_elastic_tangent()
+            else:
+                try:
+                    D_alg = self._compute_analytical_tangent()
+                except Exception:
+                    D_alg = None
 
-        ft_curr = max(self.f_t + self.H_t * self.lam_t_old, 0.0)
-        fc_curr = max(self.f_c + self.H_c * self.lam_c_old, 0.1 * self.f_c)
-        c_curr = max(self.c + self.H_s * self.lam_s_old, 0.0)
+        # Fallback на численную, если аналитическая не может быть вычислена (например, apex)
+        if D_alg is None:
+            D_alg = self._compute_numerical_tangent(current_strain)
 
-        f_t_val = sig_n_tr - ft_curr
-        f_c_val = -sig_n_tr - fc_curr
-        f_s_val = tau_tr + sig_n_tr * self.tan_phi - c_curr
-        d_lam_t = d_lam_c = d_lam_s = 0.0
+        D_alg += np.eye(6) * self.E_min
+        self.D_tangent = D_alg
 
-        if f_t_val > 0 and f_s_val > 0:
-            det = (self.E_n + self.H_t) * (self.G_s + self.E_n * self.tan_phi * self.tan_psi + self.H_s) - (
-                        self.E_n * self.tan_psi) * (self.E_n * self.tan_phi)
-            d_lam_t = ((self.G_s + self.E_n * self.tan_phi * self.tan_psi + self.H_s) * f_t_val - (
-                        self.E_n * self.tan_psi) * f_s_val) / det
-            d_lam_s = (-(self.E_n * self.tan_phi) * f_t_val + (self.E_n + self.H_t) * f_s_val) / det
-            if d_lam_t <= 0:
-                d_lam_t = 0;
-                d_lam_s = f_s_val / (self.G_s + self.E_n * self.tan_phi * self.tan_psi + self.H_s)
-            elif d_lam_s <= 0:
-                d_lam_s = 0;
-                d_lam_t = f_t_val / (self.E_n + self.H_t)
-        elif f_c_val > 0 and f_s_val > 0:
-            det = (self.E_n + self.H_c) * (self.G_s - self.E_n * self.tan_phi * self.tan_psi + self.H_s) + (
-                        self.E_n * self.tan_psi) * (self.E_n * self.tan_phi)
-            d_lam_c = ((self.G_s - self.E_n * self.tan_phi * self.tan_psi + self.H_s) * f_c_val + (
-                        self.E_n * self.tan_psi) * f_s_val) / det
-            d_lam_s = (-(self.E_n * self.tan_phi) * f_c_val + (self.E_n + self.H_c) * f_s_val) / det
-            if d_lam_c <= 0:
-                d_lam_c = 0;
-                d_lam_s = f_s_val / (self.G_s + self.E_n * self.tan_phi * self.tan_psi + self.H_s)
-            elif d_lam_s <= 0:
-                d_lam_s = 0;
-                d_lam_c = f_c_val / (self.E_n + self.H_c)
-        elif f_t_val > 0:
-            d_lam_t = f_t_val / (self.E_n + self.H_t)
-        elif f_c_val > 0:
-            d_lam_c = f_c_val / (self.E_n + self.H_c)
-        elif f_s_val > 0:
-            d_lam_s = f_s_val / (self.G_s + self.E_n * self.tan_phi * self.tan_psi + self.H_s)
+        return self.stress.copy(), self.D_tangent
 
-        sig_n = sig_n_tr - self.E_n * (d_lam_t - d_lam_c + d_lam_s * self.tan_psi)
-        tau = max(tau_tr - self.G_s * d_lam_s, 0.0)
+    def _compute_damaged_elastic_tangent(self):
+        """Аналитическая матрица для упругого шага (с учетом накопленных повреждений)"""
+        K_loc_6x6 = self.D_local.copy()
+        sig_n = self._last_sig_eff[0]
 
-        self.lam_t_trial += d_lam_t
-        self.lam_c_trial += d_lam_c
-        self.lam_s_trial += d_lam_s
+        # Берем текущие значения повреждений (trial)
+        D_n = self.D_nt_trial if sig_n >= 0.0 else self.D_nc_trial
+        D_s = self.D_s_trial
 
-        self.eps_p_n_trial += d_lam_t - d_lam_c + d_lam_s * self.tan_psi
-        if tau_tr > 1e-12:
-            self.eps_p_23_trial += d_lam_s * (tau_23_tr / tau_tr)
-            self.eps_p_13_trial += d_lam_s * (tau_13_tr / tau_tr)
+        K_loc_6x6[2, 2] *= (1.0 - D_n)
+        K_loc_6x6[4, 4] *= (1.0 - D_s)
+        K_loc_6x6[5, 5] *= (1.0 - D_s)
 
-        self.W_pl_t_trial += (sig_n * d_lam_t if d_lam_t > 0 else 0)
-        self.W_pl_c_trial += (abs(sig_n) * d_lam_c if d_lam_c > 0 else 0)
-        self.W_pl_s_trial += (tau * d_lam_s if d_lam_s > 0 else 0)
-
-        r_t = min(self.W_pl_t_trial / self.Gf_t, 1.0)
-        r_c = min(self.W_pl_c_trial / self.Gf_c, 1.0)
-        D_n_new = max(r_t * (2.0 - r_t), 0.5 * np.sin(np.pi * r_c - np.pi / 2.0) + 0.5)
-        self.D_n_trial = min(max(D_n_new, self.D_n_old), 0.999)
-
-        r_s = min(self.W_pl_s_trial / self.Gf_s, 1.0)
-        self.D_s_trial = min(max(r_s * (2.0 - r_s), self.D_s_old), 0.999)
-
-        return self.stress, self.D_tangent
+        return self.T_eps.T @ K_loc_6x6 @ self.T_eps
 
     def get_tangent_matrix(self):
         return self.D_tangent
@@ -1397,12 +2643,13 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         self.lam_c_old = self.lam_c_trial
         self.lam_s_old = self.lam_s_trial
         self.eps_p_n_old = self.eps_p_n_trial
-        self.eps_p_23_old = self.eps_p_23_trial
-        self.eps_p_13_old = self.eps_p_13_trial
+        self.gamma_p_23_old = self.gamma_p_23_trial
+        self.gamma_p_13_old = self.gamma_p_13_trial
         self.W_pl_t_old = self.W_pl_t_trial
         self.W_pl_c_old = self.W_pl_c_trial
         self.W_pl_s_old = self.W_pl_s_trial
-        self.D_n_old = self.D_n_trial
+        self.D_nt_old = self.D_nt_trial
+        self.D_nc_old = self.D_nc_trial
         self.D_s_old = self.D_s_trial
 
 
@@ -1967,7 +3214,7 @@ def calculate_criterion_shear(params, stress_tensor, material: mt.Material, mode
     return f_val, n, tau_n, resistance
 
 
-def find_critical_plane_shear(stress_tensor, material, mode='3D', num_planes=10):
+def find_critical_plane_shear(stress_tensor, material, mode='3D', num_planes=5):
     best_params = None
     max_f = -float('inf')
 
@@ -2004,7 +3251,7 @@ def calculate_criterion_tensile(params, stress_tensor, material, mode='3D'):
     return f_val, n, sigma_n, Rp_n
 
 
-def find_critical_plane_tensile(stress_tensor, material, mode='3D', num_planes=10):
+def find_critical_plane_tensile(stress_tensor, material, mode='3D', num_planes=5):
     best_params = None
     max_f = -float('inf')
 
@@ -2040,7 +3287,7 @@ def calculate_criterion_compression(params, stress_tensor, material, mode='3D'):
     return f_val, n, sigma_n, Rc_n
 
 
-def find_critical_plane_compression(stress_tensor, material, mode='3D', num_planes=10):
+def find_critical_plane_compression(stress_tensor, material, mode='3D', num_planes=5):
     best_params = None
     max_f = -float('inf')
 
@@ -2502,6 +3749,262 @@ import scipy.sparse as sp
 
 
 class MultiElementNRControl(Control):
+    def __init__(self, model, track_nodes, load_factors, track_dof=2, max_iter=300, tol=1e-3, use_line_search=True):
+        super().__init__(model)
+        self.load_factors = load_factors
+        self.num_steps = len(load_factors)
+        self.max_iter = max_iter
+        self.tol = tol
+        self.track_nodes = track_nodes
+        self.track_dof = track_dof
+        self.use_line_search = use_line_search
+
+        self.history_U = []
+        self.history_F = []
+
+        self.PENALTY = 1e15
+        self.free_dofs = None
+
+    def _precompute_topology_and_kinematics(self):
+        num_elements = len(self.model.elements)
+        ndof_per_el = len(self.model.elements[0].nodes) * 3
+        total_dofs = self.model.total_dofs
+
+        self.el_dofs_map = np.zeros((num_elements, ndof_per_el), dtype=int)
+        self.B_map = []
+        self.dV_map = []
+
+        num_k_entries = num_elements * (ndof_per_el ** 2) + len(self.model.bcs)
+        self.I_idx = np.zeros(num_k_entries, dtype=int)
+        self.J_idx = np.zeros(num_k_entries, dtype=int)
+
+        ptr = 0
+        for e_idx, element in enumerate(self.model.elements):
+            el_dofs = []
+            for node in element.nodes:
+                el_dofs.extend(node.dofs)
+            self.el_dofs_map[e_idx] = el_dofs
+
+            B_el, dV_el = [], []
+            node_coords = np.array([node.coords for node in element.nodes])
+            for ip in element.integration_points:
+                _, detJ = element.shape.get_jacobian(ip.coords, node_coords)
+                dN_dx = element.shape.get_shape_derivatives_cartesian(ip.coords, node_coords)
+                B = element.analysis_model.get_B_matrix(dN_dx)
+                h = element.analysis_model.get_h_coefficient()
+                dV = detJ * h * ip.weight
+                B_el.append(B)
+                dV_el.append(dV)
+
+            self.B_map.append(B_el)
+            self.dV_map.append(dV_el)
+
+            grid = np.meshgrid(el_dofs, el_dofs, indexing='ij')
+            self.I_idx[ptr:ptr + ndof_per_el ** 2] = grid[0].ravel()
+            self.J_idx[ptr:ptr + ndof_per_el ** 2] = grid[1].ravel()
+            ptr += ndof_per_el ** 2
+
+        self.free_dofs = np.ones(total_dofs, dtype=bool)
+        for bc in self.model.bcs:
+            dof = bc.node.dofs[bc.dof_axis]
+            self.I_idx[ptr] = dof
+            self.J_idx[ptr] = dof
+            self.free_dofs[dof] = False
+            ptr += 1
+
+    def _compute_internal_forces(self, U_eval):
+        """Вспомогательный метод для Line Search: вычисляет только F_int без сборки K"""
+        F_int = np.zeros(self.model.total_dofs)
+        for e_idx, element in enumerate(self.model.elements):
+            el_dofs = self.el_dofs_map[e_idx]
+            U_el = U_eval[el_dofs]
+            F_int_e = np.zeros(len(el_dofs))
+            for ip_idx, ip in enumerate(element.integration_points):
+                B = self.B_map[e_idx][ip_idx]
+                dV = self.dV_map[e_idx][ip_idx]
+                current_strain = B @ U_el
+                # Вызываем update_state (он безопасен, пока не вызван commit())
+                stress, _ = ip.constitutive_model.update_state(current_strain)
+                F_int_e += B.T @ stress * dV
+            F_int[el_dofs] += F_int_e
+        return F_int
+
+    def solve(self):
+        print("\nИнициализация модели и предрасчет кинематики...")
+        self.model.initialize()
+        self._precompute_topology_and_kinematics()
+
+        total_dofs = self.model.total_dofs
+        U_global = np.zeros(total_dofs)
+        V_data = np.zeros(len(self.I_idx))
+
+        prev_factor = 0.0
+        ndof_per_el = self.el_dofs_map.shape[1]
+
+        for step, current_factor in enumerate(self.load_factors, 1):
+            delta_factor = current_factor - prev_factor
+            print(f"\n=== Шаг нагрузки {step}/{self.num_steps} | Фактор: {current_factor:.5f} ===")
+
+            F_ext = np.zeros(total_dofs)
+            for load in self.model.nodal_loads:
+                dof = load.node.dofs[load.dof_axis]
+                F_ext[dof] += load.value * current_factor
+
+            norm_fext = np.linalg.norm(F_ext[self.free_dofs])
+            F_ref = norm_fext if norm_fext > 1e-12 else 1e-6
+
+            for iteration in range(self.max_iter):
+                V_data.fill(0.0)
+                F_int = np.zeros(total_dofs)
+                ptr = 0
+
+                # 1. Сборка матриц K и F_int
+                for e_idx, element in enumerate(self.model.elements):
+                    el_dofs = self.el_dofs_map[e_idx]
+                    U_el = U_global[el_dofs]
+
+                    K_e = np.zeros((ndof_per_el, ndof_per_el))
+                    F_int_e = np.zeros(ndof_per_el)
+
+                    for ip_idx, ip in enumerate(element.integration_points):
+                        B = self.B_map[e_idx][ip_idx]
+                        dV = self.dV_map[e_idx][ip_idx]
+
+                        current_strain = B @ U_el
+                        stress, D_ep = ip.constitutive_model.update_state(current_strain)
+
+                        K_e += B.T @ D_ep @ B * dV
+                        F_int_e += B.T @ stress * dV
+
+                    V_data[ptr:ptr + ndof_per_el ** 2] = K_e.ravel()
+                    ptr += ndof_per_el ** 2
+                    F_int[el_dofs] += F_int_e
+
+                Residual = F_ext - F_int
+
+                # 2. Граничные условия (Метод штрафов)
+                for bc in self.model.bcs:
+                    dof = bc.node.dofs[bc.dof_axis]
+                    delta_u = (bc.value * delta_factor) if iteration == 0 else 0.0
+                    V_data[ptr] = self.PENALTY
+                    Residual[dof] = self.PENALTY * delta_u
+                    ptr += 1
+
+                # 3. Проверка сходимости
+                norm_res = np.linalg.norm(Residual[self.free_dofs])
+                norm_fint = np.linalg.norm(F_int[self.free_dofs])
+                F_ref = max(F_ref, norm_fint)
+                error = norm_res / F_ref
+
+                if error < self.tol and iteration > 0:
+                    print(f"  -> Сходимость за {iteration} итераций. (Относит. ошибка: {error:.2e})")
+                    break
+
+                # 4. Сборка и решение СЛАУ с защитой от сингулярности
+                K_t_sparse = sp.coo_matrix((V_data, (self.I_idx, self.J_idx)), shape=(total_dofs, total_dofs)).tocsr()
+
+                try:
+                    import warnings
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", spla.MatrixRankWarning)
+                        dU = spla.spsolve(K_t_sparse, Residual)
+                except Exception as e:
+                    # Стабилизация матрицы при разупрочнении (Softening)
+                    diag = K_t_sparse.diagonal()
+                    valid_diag = diag[diag < self.PENALTY * 0.1]
+                    max_stiff = np.max(valid_diag) if len(valid_diag) > 0 else 1.0
+                    reg_matrix = sp.eye(total_dofs) * (max_stiff * 1e-4)
+                    dU = spla.spsolve(K_t_sparse + reg_matrix, Residual)
+
+                # ==========================================================
+                # 5. LINE SEARCH (Линейный поиск)
+                # ==========================================================
+                eta = 1.0
+
+                # Разделяем приращения на свободные и закрепленные узлы
+                dU_free = np.zeros_like(dU)
+                dU_free[self.free_dofs] = dU[self.free_dofs]
+
+                dU_fixed = np.zeros_like(dU)
+                dU_fixed[~self.free_dofs] = dU[~self.free_dofs]
+
+                if self.use_line_search and iteration > 0:
+                    # Проекция начальной невязки на направление поиска
+                    s0 = np.dot(dU_free, Residual)
+
+                    if abs(s0) > 1e-12:
+                        eta_prev = 0.0
+                        s_prev = s0
+                        ls_tol = 0.5  # Допуск линейного поиска (0.5 - стандарт для механики)
+
+                        for ls_iter in range(4):  # Максимум 4 итерации поиска
+                            # Пробный шаг (граничные условия dU_fixed применяются ВСЕГДА полностью!)
+                            U_ls = U_global + eta * dU_free + dU_fixed
+
+                            F_int_ls = self._compute_internal_forces(U_ls)
+                            R_ls = F_ext - F_int_ls
+
+                            s_eta = np.dot(dU_free, R_ls)
+
+                            # Условие сходимости линейного поиска
+                            if abs(s_eta) < ls_tol * abs(s0):
+                                if ls_iter > 0:
+                                    print(f"     [Line Search] Сошелся: eta = {eta:.3f} (iter {ls_iter})")
+                                break
+
+                            # Защита от деления на ноль
+                            if abs(s_eta - s_prev) < 1e-14:
+                                break
+
+                            # Обновление eta методом секущих
+                            d_eta = -s_eta * (eta - eta_prev) / (s_eta - s_prev)
+
+                            eta_prev = eta
+                            s_prev = s_eta
+                            eta = eta + d_eta
+
+                            # Ограничиваем скачки eta, чтобы не улететь слишком далеко
+                            eta = max(0.05, min(eta, 5.0))
+
+                # Обновляем глобальные перемещения с учетом найденного шага eta
+                U_global += (eta * dU_free) + dU_fixed
+
+            else:
+                print(f"  !!! ВНИМАНИЕ: Сходимость не достигнута за {self.max_iter} итераций !!! (Ошибка: {error:.2e})")
+
+            # 6. Фиксация состояния (Commit)
+            for element in self.model.elements:
+                for ip in element.integration_points:
+                    ip.constitutive_model.commit()
+
+            for node in self.model.nodes:
+                node.displacements = U_global[node.dofs]
+
+            if self.track_nodes:
+                rx_force = sum(F_int[n.dofs[self.track_dof]] for n in self.track_nodes)
+                current_u = U_global[self.track_nodes[0].dofs[self.track_dof]]
+                self.history_U.append(current_u)
+                self.history_F.append(rx_force)
+
+            prev_factor = current_factor
+
+====================
+File: .\FEM\Structure_Level\StagedNRControl.py
+====================
+
+import numpy as np
+from FEM.Abstract.Structure_Level import Control
+import scipy.sparse.linalg as spla
+import scipy.sparse as sp
+
+
+class StagedNRControl(Control):
+    """
+    Решатель Ньютона-Рафсона с поддержкой стадийного нагружения.
+    Позволяет разделять граничные условия на пропорциональные (нарастают с load_factor)
+    и постоянные (прикладываются на первом шаге и удерживаются).
+    """
+
     def __init__(self, model, track_nodes, load_factors, track_dof=2, max_iter=300, tol=1e-3):
         super().__init__(model)
         self.load_factors = load_factors
@@ -2511,7 +4014,6 @@ class MultiElementNRControl(Control):
         self.track_nodes = track_nodes
         self.track_dof = track_dof
 
-        # ИСПРАВЛЕНО: Убраны стартовые нули, чтобы избежать дублирования точек на графике
         self.history_U = []
         self.history_F = []
 
@@ -2574,21 +4076,21 @@ class MultiElementNRControl(Control):
         U_global = np.zeros(total_dofs)
         V_data = np.zeros(len(self.I_idx))
 
-        prev_factor = 0.0
         ndof_per_el = self.el_dofs_map.shape[1]
 
+        # Массив для отслеживания уже приложенных перемещений по каждому ГУ
+        applied_bc_u = [0.0] * len(self.model.bcs)
+
         for step, current_factor in enumerate(self.load_factors, 1):
-            delta_factor = current_factor - prev_factor
             print(f"\n=== Шаг нагрузки {step}/{self.num_steps} | Фактор: {current_factor:.5f} ===")
 
-            # ИСПРАВЛЕНО: Сборка вектора внешних сил (F_ext)
             F_ext = np.zeros(total_dofs)
             for load in self.model.nodal_loads:
                 dof = load.node.dofs[load.dof_axis]
-                F_ext[dof] += load.value * current_factor
+                is_prop = getattr(load, 'is_proportional', True)
+                factor = current_factor if is_prop else 1.0
+                F_ext[dof] += load.value * factor
 
-            # Базовая сила для этого шага (для избежания деления на 0 при расчете ошибки)
-            # ИСПРАВЛЕНО: Используем норму внешних сил, а не магическое число 1.0
             norm_fext = np.linalg.norm(F_ext[self.free_dofs])
             F_ref = norm_fext if norm_fext > 1e-12 else 1e-6
 
@@ -2597,7 +4099,7 @@ class MultiElementNRControl(Control):
                 F_int = np.zeros(total_dofs)
                 ptr = 0
 
-                # 1. Сборка матриц
+                # 1. Сборка K и F_int
                 for e_idx, element in enumerate(self.model.elements):
                     el_dofs = self.el_dofs_map[e_idx]
                     U_el = U_global[el_dofs]
@@ -2615,45 +4117,60 @@ class MultiElementNRControl(Control):
                         K_e += B.T @ D_ep @ B * dV
                         F_int_e += B.T @ stress * dV
 
-                    # ИСПРАВЛЕНО: Используем .ravel() вместо .flat для надежного присвоения
                     V_data[ptr:ptr + ndof_per_el ** 2] = K_e.ravel()
                     ptr += ndof_per_el ** 2
                     F_int[el_dofs] += F_int_e
 
-                # ИСПРАВЛЕНО: Невязка = Внешние силы - Внутренние силы
                 Residual = F_ext - F_int
 
-                # 2. Граничные условия (Метод штрафов)
-                for bc in self.model.bcs:
+                # 2. Граничные условия
+                for bc_idx, bc in enumerate(self.model.bcs):
                     dof = bc.node.dofs[bc.dof_axis]
-                    delta_u = (bc.value * delta_factor) if iteration == 0 else 0.0
+
+                    if iteration == 0:
+                        is_prop = getattr(bc, 'is_proportional', True)
+                        target_u = (bc.value * current_factor) if is_prop else bc.value
+                        delta_u = target_u - applied_bc_u[bc_idx]
+                        applied_bc_u[bc_idx] = target_u
+                    else:
+                        delta_u = 0.0
+
                     V_data[ptr] = self.PENALTY
                     Residual[dof] = self.PENALTY * delta_u
                     ptr += 1
 
-                # 3. Сборка СЛАУ
-                K_t_sparse = sp.coo_matrix((V_data, (self.I_idx, self.J_idx)), shape=(total_dofs, total_dofs)).tocsr()
-
-                # 4. Проверка сходимости
+                # 3. Сходимость
                 norm_res = np.linalg.norm(Residual[self.free_dofs])
                 norm_fint = np.linalg.norm(F_int[self.free_dofs])
-
-                # Динамически обновляем F_ref, если внутренние силы стали больше внешних
                 F_ref = max(F_ref, norm_fint)
-
                 error = norm_res / F_ref
 
                 if error < self.tol and iteration > 0:
-                    print(f"  -> Сходимость за {iteration} итераций. (Относит. ошибка: {error:.2e})")
+                    print(f"  -> Сходимость за {iteration} итераций. (Ошибка: {error:.2e})")
                     break
 
-                # 5. Решение СЛАУ
-                dU = spla.spsolve(K_t_sparse, Residual)
+                # 4. Решение СЛАУ
+                K_t_sparse = sp.coo_matrix((V_data, (self.I_idx, self.J_idx)), shape=(total_dofs, total_dofs)).tocsr()
+
+                try:
+                    import warnings
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", spla.MatrixRankWarning)
+                        dU = spla.spsolve(K_t_sparse, Residual)
+                except Exception as e:
+                    diag = K_t_sparse.diagonal()
+                    valid_diag = diag[diag < self.PENALTY * 0.1]
+                    max_stiff = np.max(valid_diag) if len(valid_diag) > 0 else 1.0
+                    reg_matrix = sp.eye(total_dofs) * (max_stiff * 1e-4)
+                    dU = spla.spsolve(K_t_sparse + reg_matrix, Residual)
+
+                # 5. Обновление
                 U_global += dU
+
             else:
                 print(f"  !!! ВНИМАНИЕ: Сходимость не достигнута за {self.max_iter} итераций !!! (Ошибка: {error:.2e})")
 
-            # 6. Фиксация состояния (Commit)
+            # 6. Фиксация состояния
             for element in self.model.elements:
                 for ip in element.integration_points:
                     ip.constitutive_model.commit()
@@ -2661,15 +4178,220 @@ class MultiElementNRControl(Control):
             for node in self.model.nodes:
                 node.displacements = U_global[node.dofs]
 
-            # Сохранение реакций
-            # Если track_nodes пустой, защищаем код от падения
             if self.track_nodes:
                 rx_force = sum(F_int[n.dofs[self.track_dof]] for n in self.track_nodes)
                 current_u = U_global[self.track_nodes[0].dofs[self.track_dof]]
                 self.history_U.append(current_u)
                 self.history_F.append(rx_force)
 
-            prev_factor = current_factor
+
+====================
+File: .\FEM\Structure_Level\StagedNRControl2D.py
+====================
+
+import numpy as np
+from FEM.Abstract.Structure_Level import Control
+import scipy.sparse.linalg as spla
+import scipy.sparse as sp
+
+
+class StagedNRControl2D(Control):
+    """
+    Решатель Ньютона-Рафсона с поддержкой стадийного нагружения для 2D задач.
+    Поддерживает мульти-элементные сетки (например, сплошные QUAD4 + дискретные SpringElement2D).
+    """
+
+    def __init__(self, model, track_nodes, load_factors, track_dof=1, max_iter=300, tol=1e-3):
+        super().__init__(model)
+        self.load_factors = load_factors
+        self.num_steps = len(load_factors)
+        self.max_iter = max_iter
+        self.tol = tol
+        self.track_nodes = track_nodes
+        self.track_dof = track_dof
+
+        self.history_U = []
+        self.history_F = []
+
+        self.PENALTY = 1e15
+        self.free_dofs = None
+
+    def _precompute_topology_and_kinematics(self):
+        total_dofs = self.model.total_dofs
+
+        self.el_dofs_map = []
+        self.B_map = []
+        self.dV_map = []
+        self.is_discrete_map = []
+
+        # Динамический подсчет количества записей для sparse матрицы
+        num_k_entries = sum((len(el.nodes) * 2) ** 2 for el in self.model.elements) + len(self.model.bcs)
+
+        self.I_idx = np.zeros(num_k_entries, dtype=int)
+        self.J_idx = np.zeros(num_k_entries, dtype=int)
+
+        ptr = 0
+        for e_idx, element in enumerate(self.model.elements):
+            el_dofs = []
+            for node in element.nodes:
+                el_dofs.extend(node.dofs)
+            self.el_dofs_map.append(np.array(el_dofs, dtype=int))
+            ndof_e = len(el_dofs)
+
+            # Проверка типа элемента (сплошной или дискретный/пружинный)
+            if getattr(element, 'is_spring', False):
+                self.is_discrete_map.append(True)
+                self.B_map.append([])
+                self.dV_map.append([])
+            else:
+                self.is_discrete_map.append(False)
+                B_el, dV_el = [], []
+                node_coords = np.array([node.coords for node in element.nodes])
+                for ip in element.integration_points:
+                    _, detJ = element.shape.get_jacobian(ip.coords, node_coords)
+                    dN_dx = element.shape.get_shape_derivatives_cartesian(ip.coords, node_coords)
+                    B = element.analysis_model.get_B_matrix(dN_dx)
+                    h = element.analysis_model.get_h_coefficient()
+                    dV = detJ * h * ip.weight
+                    B_el.append(B)
+                    dV_el.append(dV)
+                self.B_map.append(B_el)
+                self.dV_map.append(dV_el)
+
+            # Заполнение индексов для сборки матрицы (работает для любого размера ndof_e)
+            grid = np.meshgrid(el_dofs, el_dofs, indexing='ij')
+            self.I_idx[ptr:ptr + ndof_e ** 2] = grid[0].ravel()
+            self.J_idx[ptr:ptr + ndof_e ** 2] = grid[1].ravel()
+            ptr += ndof_e ** 2
+
+        self.free_dofs = np.ones(total_dofs, dtype=bool)
+        for bc in self.model.bcs:
+            dof = bc.node.dofs[bc.dof_axis]
+            self.I_idx[ptr] = dof
+            self.J_idx[ptr] = dof
+            self.free_dofs[dof] = False
+            ptr += 1
+
+    def solve(self):
+        print("\nИнициализация модели и предрасчет кинематики...")
+        self.model.initialize()
+        self._precompute_topology_and_kinematics()
+
+        total_dofs = self.model.total_dofs
+        U_global = np.zeros(total_dofs)
+        V_data = np.zeros(len(self.I_idx))
+
+        applied_bc_u = [0.0] * len(self.model.bcs)
+
+        for step, current_factor in enumerate(self.load_factors, 1):
+            print(f"\n=== Шаг нагрузки {step}/{self.num_steps} | Фактор: {current_factor:.5f} ===")
+
+            F_ext = np.zeros(total_dofs)
+            for load in self.model.nodal_loads:
+                dof = load.node.dofs[load.dof_axis]
+                is_prop = getattr(load, 'is_proportional', True)
+                factor = current_factor if is_prop else 1.0
+                F_ext[dof] += load.value * factor
+
+            norm_fext = np.linalg.norm(F_ext[self.free_dofs])
+            F_ref = norm_fext if norm_fext > 1e-12 else 1e-6
+
+            for iteration in range(self.max_iter):
+                V_data.fill(0.0)
+                F_int = np.zeros(total_dofs)
+                ptr = 0
+
+                # 1. Сборка K и F_int
+                for e_idx, element in enumerate(self.model.elements):
+                    el_dofs = self.el_dofs_map[e_idx]
+                    U_el = U_global[el_dofs]
+                    ndof_e = len(el_dofs)
+
+                    if self.is_discrete_map[e_idx]:
+                        # Обработка специального пружинного элемента
+                        K_e = element.compute_stiffness()
+                        F_int_e = element.compute_internal_force(U_el)
+                    else:
+                        # Обработка стандартного континуального элемента
+                        K_e = np.zeros((ndof_e, ndof_e))
+                        F_int_e = np.zeros(ndof_e)
+                        for ip_idx, ip in enumerate(element.integration_points):
+                            B = self.B_map[e_idx][ip_idx]
+                            dV = self.dV_map[e_idx][ip_idx]
+
+                            current_strain = B @ U_el
+                            stress, D_ep = ip.constitutive_model.update_state(current_strain)
+
+                            K_e += B.T @ D_ep @ B * dV
+                            F_int_e += B.T @ stress * dV
+
+                    V_data[ptr:ptr + ndof_e ** 2] = K_e.ravel()
+                    ptr += ndof_e ** 2
+                    F_int[el_dofs] += F_int_e
+
+                Residual = F_ext - F_int
+
+                # 2. Граничные условия
+                for bc_idx, bc in enumerate(self.model.bcs):
+                    dof = bc.node.dofs[bc.dof_axis]
+
+                    if iteration == 0:
+                        is_prop = getattr(bc, 'is_proportional', True)
+                        target_u = (bc.value * current_factor) if is_prop else bc.value
+                        delta_u = target_u - applied_bc_u[bc_idx]
+                        applied_bc_u[bc_idx] = target_u
+                    else:
+                        delta_u = 0.0
+
+                    V_data[ptr] = self.PENALTY
+                    Residual[dof] = self.PENALTY * delta_u
+                    ptr += 1
+
+                # 3. Сходимость
+                norm_res = np.linalg.norm(Residual[self.free_dofs])
+                norm_fint = np.linalg.norm(F_int[self.free_dofs])
+                F_ref = max(F_ref, norm_fint)
+                error = norm_res / F_ref
+
+                if error < self.tol and iteration > 0:
+                    print(f"  -> Сходимость за {iteration} итераций. (Ошибка: {error:.2e})")
+                    break
+
+                # 4. Решение СЛАУ
+                K_t_sparse = sp.coo_matrix((V_data, (self.I_idx, self.J_idx)), shape=(total_dofs, total_dofs)).tocsr()
+
+                try:
+                    import warnings
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", spla.MatrixRankWarning)
+                        dU = spla.spsolve(K_t_sparse, Residual)
+                except Exception as e:
+                    diag = K_t_sparse.diagonal()
+                    valid_diag = diag[diag < self.PENALTY * 0.1]
+                    max_stiff = np.max(valid_diag) if len(valid_diag) > 0 else 1.0
+                    reg_matrix = sp.eye(total_dofs) * (max_stiff * 1e-4)
+                    dU = spla.spsolve(K_t_sparse + reg_matrix, Residual)
+
+                # 5. Обновление
+                U_global += dU
+
+            else:
+                print(f"  !!! ВНИМАНИЕ: Сходимость не достигнута за {self.max_iter} итераций !!! (Ошибка: {error:.2e})")
+
+            # 6. Фиксация состояния
+            for element in self.model.elements:
+                if not getattr(element, 'is_spring', False):
+                    for ip in element.integration_points:
+                        ip.constitutive_model.commit()
+
+            for node in self.model.nodes:
+                node.displacements = U_global[node.dofs]
+
+            if self.track_nodes:
+                rx_force = sum(F_int[n.dofs[self.track_dof]] for n in self.track_nodes)
+                current_u = U_global[self.track_nodes[0].dofs[self.track_dof]]
+                self.history_U.append(current_u)
+                self.history_F.append(rx_force)
 
 
 ====================

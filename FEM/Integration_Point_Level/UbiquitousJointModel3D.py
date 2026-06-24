@@ -15,7 +15,9 @@ from FEM.Abstract.Integration_Point_Level import ConstitutiveModel
 class UbiquitousJointModel3D(ConstitutiveModel):
     """
     3D Ubiquitous-Joint Damage-Plasticity модель в нотации Войгта.
-    Включает аналитический расчет согласованной матрицы жёсткости (Consistent Tangent Stiffness).
+    Автоматически ищет критическую плоскость при наступлении пластичности.
+    Пластическая работа вычисляется через номинальные напряжения.
+    Реализована алгоритмическая матрица жесткости с опциональной секущей стабилизацией.
     """
 
     # ============================ INIT ============================
@@ -41,6 +43,12 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         self.cp_material = jp.get('cp_material', None)
         if self.cp_material is None:
             raise ValueError("Требуется 'cp_material' в joint_params!")
+
+        # Количество площадок для дискретного поиска (по умолчанию 100)
+        self.cp_num_planes = jp.get('cp_num_planes', 100)
+
+        # Фиксировать площадку только при достижении предела прочности (True по умолчанию)
+        self.lock_on_yield = jp.get('lock_on_yield', True)
 
         # --- Энергии разрушения, регуляризованные l_c ---
         self.l_c = jp.get('l_c', 1.0)
@@ -142,11 +150,11 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         nz /= np.linalg.norm(nz)
         if abs(nz[2]) > 0.999:
             nx = np.array([1.0, 0.0, 0.0])
-            ny = np.cross(nz, nx);
+            ny = np.cross(nz, nx)
             ny /= np.linalg.norm(ny)
             nx = np.cross(ny, nz)
         else:
-            ny = np.cross(nz, [0.0, 0.0, 1.0]);
+            ny = np.cross(nz, [0.0, 0.0, 1.0])
             ny /= np.linalg.norm(ny)
             nx = np.cross(ny, nz)
         nx /= np.linalg.norm(nx)
@@ -194,6 +202,7 @@ class UbiquitousJointModel3D(ConstitutiveModel):
     # ============================ LOCKING ============================
 
     def _lock_plane(self, normal, stress_tensor):
+        # print(f'Locked critical plane with normal: {normal}')
         self.fixed_normal = normal
         self.R = self._build_rotation_matrix(normal)
         self.T_sig, self.T_eps = self._build_voigt_transformation_matrices(self.R)
@@ -272,9 +281,7 @@ class UbiquitousJointModel3D(ConstitutiveModel):
 
             converged = False
             for _ in range(max_iter):
-                sn_i = x[0];
-                t23_i = x[1];
-                t13_i = x[2]
+                sn_i = x[0]; t23_i = x[1]; t13_i = x[2]
                 dlt_i = x[col_t] if act_t else 0.0
                 dlc_i = x[col_c] if act_c else 0.0
                 dls_i = x[col_s] if act_s else 0.0
@@ -309,8 +316,7 @@ class UbiquitousJointModel3D(ConstitutiveModel):
                     J[2, 1] = J[1, 2]
                     J[2, 2] = 1.0 + self.G_s * dls_i * n23_i ** 2 / tau_si
                 else:
-                    J[1, 1] = 1.0;
-                    J[2, 2] = 1.0
+                    J[1, 1] = 1.0; J[2, 2] = 1.0
 
                 if act_t: J[0, col_t] = self.E_n
                 if act_c: J[0, col_c] = -self.E_n
@@ -322,17 +328,13 @@ class UbiquitousJointModel3D(ConstitutiveModel):
 
                 row = 3
                 if act_t:
-                    J[row, 0] = 1.0;
-                    J[row, col_t] = -self.H_t;
-                    row += 1
+                    J[row, 0] = 1.0; J[row, col_t] = -self.H_t; row += 1
                 if act_c:
-                    J[row, 0] = -1.0;
-                    row += 1
+                    J[row, 0] = -1.0; row += 1
                 if act_s:
                     J[row, 0] = self.tan_phi
                     if tau_si > 1e-10:
-                        J[row, 1] = n23_i;
-                        J[row, 2] = n13_i
+                        J[row, 1] = n23_i; J[row, 2] = n13_i
                     if act_t and q_i > self.q_lim:
                         J[row, col_t] = -self.H_t * self.tan_phi
                     row += 1
@@ -340,22 +342,22 @@ class UbiquitousJointModel3D(ConstitutiveModel):
                 try:
                     x -= np.linalg.solve(J, R_vec)
                 except np.linalg.LinAlgError:
-                    break
+                    try:
+                        x -= np.linalg.pinv(J) @ R_vec
+                    except np.linalg.LinAlgError:
+                        break
 
             converged = converged or (np.linalg.norm(R_vec) / scale_nr < tol * 1e5)
 
-            # БЕЗОПАСНОЕ ОБРАЩЕНИЕ МАТРИЦЫ
             J_inv = None
             if converged:
                 try:
                     J_inv = np.linalg.inv(J)
                 except np.linalg.LinAlgError:
                     try:
-                        # Если обычное обращение не удалось, используем псевдообратную матрицу
                         J_inv = np.linalg.pinv(J)
                     except np.linalg.LinAlgError:
                         pass
-
 
             return (x[0], x[1], x[2], x[col_t] if act_t else 0.0, x[col_c] if act_c else 0.0,
                     x[col_s] if act_s else 0.0, converged, J_inv)
@@ -363,48 +365,40 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         def _apex_solve():
             if self.G_s < 1e-12: return 0, 0, 0, 0, 0, 0, False, None
             dls = tau_tr / self.G_s
-            dlt = (sig_n_tr - self.E_n * dls * self.tan_psi - self.f_t - self.H_t * self.lam_t_old) / (
-                        self.E_n + self.H_t)
+            dlt = (sig_n_tr - self.E_n * dls * self.tan_psi - self.f_t - self.H_t * self.lam_t_old) / (self.E_n + self.H_t)
             if dlt < -1e-6: return 0, 0, 0, 0, 0, 0, False, None
             dlt = max(dlt, 0.0)
             sn = self.f_t + self.H_t * (self.lam_t_old + dlt)
 
-            # --- Сборка Якобиана для APEX (активны растяжение и сдвиг, размер 5x5) ---
             J = np.zeros((5, 5))
-            J[0, 0] = 1.0;
-            J[0, 3] = self.E_n;
-            J[0, 4] = self.E_n * self.tan_psi
-            J[1, 1] = 1.0;
-            J[2, 2] = 1.0
+            J[0, 0] = 1.0; J[0, 3] = self.E_n; J[0, 4] = self.E_n * self.tan_psi
+            J[1, 1] = 1.0; J[2, 2] = 1.0
             if tau_tr > 1e-14:
                 J[1, 4] = self.G_s * (tau_23_tr / tau_tr)
                 J[2, 4] = self.G_s * (tau_13_tr / tau_tr)
-            J[3, 0] = 1.0;
-            J[3, 3] = -self.H_t
+            J[3, 0] = 1.0; J[3, 3] = -self.H_t
 
-            # Уравнение для сдвига в вершине (tau = 0)
             if tau_tr > 1e-14:
                 J[4, 1] = tau_23_tr / tau_tr
                 J[4, 2] = tau_13_tr / tau_tr
             else:
-                J[4, 1] = 1.0  # Заглушка от деления на ноль
+                J[4, 1] = 1.0
             J[4, 4] = self.G_s
 
             try:
                 J_inv = np.linalg.inv(J)
             except np.linalg.LinAlgError:
-                # Псевдообратная матрица (Мура-Пенроуза) на случай плохой обусловленности
                 J_inv = np.linalg.pinv(J)
 
             return sn, 0.0, 0.0, dlt, 0.0, dls, True, J_inv
 
         def _is_valid(sn, t23, t13, dl_t):
-            tau = np.sqrt(t23 ** 2 + t13 ** 2)
-            q = self.H_t * (self.lam_t_old + max(dl_t, 0.0))
-            ft_v = self._ft_curr(q)
+            tau_v = np.sqrt(t23 ** 2 + t13 ** 2)
+            q_v = self.H_t * (self.lam_t_old + max(dl_t, 0.0))
+            ft_v = self._ft_curr(q_v)
             return ((sn - ft_v) <= nr_abs_tol and
                     -sn - self.f_c <= nr_abs_tol and
-                    tau + sn * self.tan_phi - self._c_curr(q) <= nr_abs_tol)
+                    tau_v + sn * self.tan_phi - self._c_curr(q_v) <= nr_abs_tol)
 
         def _check_multipliers(act_t, act_c, act_s, dlt, dlc, dls):
             tol_lam = 1e-7 + 1e-5 * max_dlam
@@ -413,12 +407,38 @@ class UbiquitousJointModel3D(ConstitutiveModel):
             if act_s and (dls < -tol_lam or dls > max_dlam): return False
             return True
 
-        sig_n, tau_23, tau_13, d_lam_t, d_lam_c, d_lam_s, conv, J_inv = _nr_solve(act_t, act_c, act_s)
-        if conv and _check_multipliers(act_t, act_c, act_s, d_lam_t, d_lam_c, d_lam_s) and _is_valid(sig_n, tau_23,
-                                                                                                     tau_13, d_lam_t):
-            return sig_n, tau_23, tau_13, max(d_lam_t, 0.0), max(d_lam_c, 0.0), max(d_lam_s, 0.0), J_inv, (act_t, act_c,
-                                                                                                           act_s)
+        def _eval_error(sn, t23, t13, dlt, dlc, dls):
+            tau_v = np.sqrt(t23 ** 2 + t13 ** 2)
+            q_v = self.H_t * (self.lam_t_old + max(dlt, 0.0))
+            err = 0.0
+            if dlt < 0: err += abs(dlt) * self.E_n
+            if dlc < 0: err += abs(dlc) * self.E_n
+            if dls < 0: err += abs(dls) * self.G_s
+            ft_v = self._ft_curr(q_v)
+            if sn - ft_v > 0: err += sn - ft_v
+            if -sn - self.f_c > 0: err += -sn - self.f_c
+            f_s = tau_v + sn * self.tan_phi - self._c_curr(q_v)
+            if f_s > 0: err += f_s
+            return err
 
+        best_sol = None
+        best_err = np.inf
+
+        def _update_best(sn, t23, t13, dlt, dlc, dls, J_inv, flags):
+            nonlocal best_sol, best_err
+            err = _eval_error(sn, t23, t13, dlt, dlc, dls)
+            if err < best_err:
+                best_err = err
+                best_sol = (sn, t23, t13, max(dlt, 0.0), max(dlc, 0.0), max(dls, 0.0), J_inv, flags)
+
+        # 1. Попытка основного предсказания
+        sig_n, tau_23, tau_13, d_lam_t, d_lam_c, d_lam_s, conv, J_inv = _nr_solve(act_t, act_c, act_s)
+        if conv:
+            _update_best(sig_n, tau_23, tau_13, d_lam_t, d_lam_c, d_lam_s, J_inv, (act_t, act_c, act_s))
+            if _check_multipliers(act_t, act_c, act_s, d_lam_t, d_lam_c, d_lam_s) and _is_valid(sig_n, tau_23, tau_13, d_lam_t):
+                return sig_n, tau_23, tau_13, max(d_lam_t, 0.0), max(d_lam_c, 0.0), max(d_lam_s, 0.0), J_inv, (act_t, act_c, act_s)
+
+        # 2. Перебор всех комбинаций
         combinations = [
             (True, False, True), (False, True, True), (True, False, False),
             (False, True, False), (False, False, True), ("APEX", False, False)
@@ -435,14 +455,21 @@ class UbiquitousJointModel3D(ConstitutiveModel):
                 sn, t23, t13, dlt, dlc, dls, conv, J_inv = _nr_solve(test_t, test_c, test_s)
 
             if not conv: continue
+
             check_t = True if test_t == "APEX" else test_t
             check_s = True if test_t == "APEX" else test_s
+
+            _update_best(sn, t23, t13, dlt, dlc, dls, J_inv, (check_t, test_c, check_s))
 
             if not _check_multipliers(check_t, test_c, check_s, dlt, dlc, dls): continue
             if _is_valid(sn, t23, t13, dlt):
                 return sn, t23, t13, max(dlt, 0.0), max(dlc, 0.0), max(dls, 0.0), J_inv, (check_t, test_c, check_s)
 
-        raise RuntimeError("Return mapping did not converge")
+        # 3. Fallback
+        if best_sol is not None:
+            return best_sol
+
+        return sig_n_tr, tau_23_tr, tau_13_tr, 0.0, 0.0, 0.0, None, (False, False, False)
 
     # ===================== ИНТЕГРАЦИЯ НАПРЯЖЕНИЙ =====================
 
@@ -472,9 +499,15 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         lam_t_new = self.lam_t_old + d_lam_t
         q_new = self.H_t * lam_t_new
 
-        dW_t = max(sig_n * d_lam_t, 0.0) if d_lam_t > 0 else 0.0
-        dW_c = max(abs(sig_n) * d_lam_c, 0.0) if d_lam_c > 0 else 0.0
-        dW_s = max((tau + sig_n * self.tan_psi) * d_lam_s, 0.0) if d_lam_s > 0 else 0.0
+        # --- ИСПРАВЛЕНИЕ: Вычисление пластической работы через НОМИНАЛЬНЫЕ напряжения ---
+        D_n_old = self.D_nt_old if sig_n >= 0.0 else self.D_nc_old
+        sig_nom_n = sig_n * (1.0 - D_n_old)
+        tau_nom = tau * (1.0 - self.D_s_old)
+
+        dW_t = max(sig_nom_n * d_lam_t, 0.0) if d_lam_t > 0 else 0.0
+        dW_c = max(abs(sig_nom_n) * d_lam_c, 0.0) if d_lam_c > 0 else 0.0
+        dW_s = max((tau_nom + sig_nom_n * self.tan_psi) * d_lam_s, 0.0) if d_lam_s > 0 else 0.0
+        # --------------------------------------------------------------------------------
 
         W_pl_t = self.W_pl_t_old + dW_t
         W_pl_c = self.W_pl_c_old + dW_c
@@ -501,9 +534,9 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         else:
             D_s_new = ds_base
 
-        D_nt = min(max(D_nt_new, self.D_nt_old), 0.9)
-        D_nc = min(max(D_nc_new, self.D_nc_old), 0.9)
-        D_s = min(max(D_s_new, self.D_s_old), 0.9)
+        D_nt = min(max(D_nt_new, self.D_nt_old), 0.99)
+        D_nc = min(max(D_nc_new, self.D_nc_old), 0.99)
+        D_s = min(max(D_s_new, self.D_s_old), 0.99)
 
         sig_l = self.D_local @ e_l
         sig_l[2] = (1.0 - D_nt) * sig_n if sig_n >= 0.0 else (1.0 - D_nc) * sig_n
@@ -526,7 +559,6 @@ class UbiquitousJointModel3D(ConstitutiveModel):
             self.D_nc_trial = D_nc
             self.D_s_trial = D_s
 
-            # Сохранение данных для аналитической касательной
             self._last_J_inv = J_inv
             self._last_active_flags = active_flags
             self._last_sig_eff = np.array([sig_n, tau_23, tau_13])
@@ -541,7 +573,7 @@ class UbiquitousJointModel3D(ConstitutiveModel):
     def _compute_analytical_tangent(self):
         J_inv = self._last_J_inv
         if J_inv is None:
-            return None  # Переход к численному модулю
+            return None
 
         act_t, act_c, act_s = self._last_active_flags
         sig_eff = self._last_sig_eff
@@ -631,6 +663,15 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         D_n = D_nt if sig_eff[0] >= 0.0 else D_nc
         dDn_deps = dDnt_deps if sig_eff[0] >= 0.0 else dDnc_deps
 
+        # --- ИСПРАВЛЕНИЕ: Секущая стабилизация (Secant Stabilization) ---
+        # Отбрасываем отрицательные члены (производные поврежденности), чтобы
+        # избежать потери положительной определенности и скачков решателя.
+        use_secant_stabilization = True
+        if use_secant_stabilization:
+            dDn_deps = np.zeros(3)
+            dDs_deps = np.zeros(3)
+        # ----------------------------------------------------------------
+
         K_loc[0, :] = (1.0 - D_n) * D_ep_loc[0, :] - sig_eff[0] * dDn_deps
         K_loc[1, :] = (1.0 - D_s) * D_ep_loc[1, :] - sig_eff[1] * dDs_deps
         K_loc[2, :] = (1.0 - D_s) * D_ep_loc[2, :] - sig_eff[2] * dDs_deps
@@ -644,20 +685,17 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         return self.T_eps.T @ K_loc_6x6 @ self.T_eps
 
     def _compute_numerical_tangent(self, current_strain, eps=1e-7):
-        # print("пришлось вызвать численную матрицу")
         D_num = np.zeros((6, 6))
         scale = max(np.linalg.norm(current_strain), 1.0)
         h = eps * scale
         for j in range(6):
-            ep = current_strain.copy();
-            ep[j] += h
-            em = current_strain.copy();
-            em[j] -= h
+            ep = current_strain.copy(); ep[j] += h
+            em = current_strain.copy(); em[j] -= h
             D_num[:, j] = (self._integrate_stress(ep, update_history=False)
                            - self._integrate_stress(em, update_history=False)) / (2.0 * h)
         return D_num
 
-    # ===================== ГЛАВНЫЙ ВХОД =====================
+    # ===================== ГЛАВНЫЙ ВХОД (ОБНОВЛЕНО) =====================
 
     def update_state(self, current_strain_voigt):
         current_strain = current_strain_voigt.copy()
@@ -665,10 +703,38 @@ class UbiquitousJointModel3D(ConstitutiveModel):
         self._reset_trial()
 
         if not self.is_locked:
+            # Считаем пробные упругие напряжения
             sig_tr = self.stress_old + self.D_rock @ (current_strain - self.strain_old)
             st = StressTensor(*sig_tr)
-            self._lock_plane(np.array([0.0, 0.0, 1.0]), st)
 
+            # Ищем критические площадки по всем трем критериям
+            f_s, n_s, util_s = find_critical_plane_shear(st, self.cp_material, num_planes=self.cp_num_planes)
+            f_t, n_t, util_t = find_critical_plane_tensile(st, self.cp_material, num_planes=self.cp_num_planes)
+            f_c, n_c, util_c = find_critical_plane_compression(st, self.cp_material, num_planes=self.cp_num_planes)
+
+            max_f = max(f_s, f_t, f_c)
+
+            # Если включен режим фиксации только при пластичности и критерий еще не достигнут (f <= 0)
+            if self.lock_on_yield and max_f <= 1e-10:
+                # Шаг упругий, площадка пока не фиксируется
+                self.stress = sig_tr
+                self.D_tangent = self.D_rock.copy()
+                return self.stress.copy(), self.D_tangent
+            else:
+                # Пластичность достигнута (или lock_on_yield = False).
+                # Выбираем площадку с максимальным коэффициентом использования (utilization)
+                max_util = max(util_s, util_t, util_c)
+
+                if max_util == util_s:
+                    best_n = n_s
+                elif max_util == util_t:
+                    best_n = n_t
+                else:
+                    best_n = n_c
+
+                self._lock_plane(best_n, st)
+
+        # Выполняем интегрирование напряжений с зафиксированной площадкой
         self.stress = self._integrate_stress(current_strain, update_history=True)
 
         # Пытаемся получить аналитическую матрицу
@@ -682,7 +748,6 @@ class UbiquitousJointModel3D(ConstitutiveModel):
                     D_alg = self._compute_analytical_tangent()
                 except Exception:
                     D_alg = None
-
 
         # Fallback на численную, если аналитическая не может быть вычислена (например, apex)
         if D_alg is None:

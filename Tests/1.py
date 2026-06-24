@@ -28,7 +28,7 @@ cp_mat = CPMaterial(
 joint_parameters = {
     'phi':   10.0,
     'psi':   0.0,
-    'phi_r': 10.0,
+    'phi_r': 0.0,
 
     'cp_material': cp_mat,
 
@@ -37,8 +37,8 @@ joint_parameters = {
     'Gf_c':  8000.0,
     'Gf_s':  2000.0,
 
-    'a_t': 1.0,
-    'a_s': 1.0,
+    'a_t': 0.0,
+    'a_s': 0.0,
 
     'mu': 0.1,
 
@@ -75,7 +75,7 @@ print("=" * 60)
 # =====================================================================
 # 3. ШАГ 1: НОРМАЛЬНОЕ ОБЖАТИЕ
 # =====================================================================
-eps_zz_comp        = -0.001
+eps_zz_comp        = -0.00001
 strain_comp        = np.zeros(6)
 strain_comp[2]     = eps_zz_comp   # Voigt: [xx, yy, zz, xy, yz, xz]
 

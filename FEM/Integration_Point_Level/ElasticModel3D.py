@@ -1,12 +1,7 @@
 from FEM.Abstract.Integration_Point_Level import ConstitutiveModel
-from FEM.Abstract.Structure_Level import Node
 import numpy as np
-from FEM.Abstract.Element_Level import Shape, AnalysisModel, ElementFactory
-from FEM.Abstract.Integration_Point_Level import IntegrationPoint
-from FEM.Element_Level.Solid3DModel import *
 
-
-# 1. Простая 3D упругая модель для теста
+# 1. Простая 3D упругая модель
 class ElasticModel3D(ConstitutiveModel):
     def get_tangent_matrix(self):
         E = self.material.E
@@ -24,3 +19,19 @@ class ElasticModel3D(ConstitutiveModel):
     def get_stress(self, strain):
         return self.get_tangent_matrix() @ strain
 
+    # --- ДОБАВЛЕНО ДЛЯ СОВМЕСТИМОСТИ С НЕЛИНЕЙНЫМ РЕШАТЕЛЕМ ---
+    def update_state(self, current_strain):
+        """
+        Возвращает текущие напряжения и касательную матрицу жесткости.
+        Для линейной упругости D - константа, а stress = D * strain.
+        """
+        D_ep = self.get_tangent_matrix()
+        stress = D_ep @ current_strain
+        return stress, D_ep
+
+    def commit(self):
+        """
+        Фиксация внутренних переменных состояния.
+        Для упругости история не нужна, поэтому просто pass.
+        """
+        pass
