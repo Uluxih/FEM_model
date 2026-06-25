@@ -27,7 +27,7 @@ cp_mat = CPMaterial(
 
 joint_parameters = {
     'phi':   10.0,
-    'psi':   0.0,
+    'psi':   10.0,
     'phi_r': 0.0,
 
     'cp_material': cp_mat,

@@ -167,7 +167,17 @@ class StagedNRControl2D(Control):
                     break
 
                 # 4. Решение СЛАУ
+
+                # Добавляем небольшую регуляризацию на диагональ для стабилизации (например, 1e-6 от максимального элемента)
+                diag_values = V_data[self.I_idx == self.J_idx]
+                valid_diag = diag_values[diag_values < self.PENALTY * 0.1]
+                max_stiff = np.max(valid_diag) if len(valid_diag) > 0 else 1.0
+                reg_value = max_stiff * 1e-5 # Малое значение искусственной жесткости
+
                 K_t_sparse = sp.coo_matrix((V_data, (self.I_idx, self.J_idx)), shape=(total_dofs, total_dofs)).tocsr()
+
+                # Принудительно добавляем регуляризацию, чтобы матрица никогда не была сингулярной
+                reg_matrix = sp.eye(total_dofs) * reg_value
 
                 try:
                     import warnings
@@ -178,8 +188,18 @@ class StagedNRControl2D(Control):
                     diag = K_t_sparse.diagonal()
                     valid_diag = diag[diag < self.PENALTY * 0.1]
                     max_stiff = np.max(valid_diag) if len(valid_diag) > 0 else 1.0
-                    reg_matrix = sp.eye(total_dofs) * (max_stiff * 1e-4)
+                    reg_matrix = sp.eye(total_dofs) * (max_stiff * 1e-5)
                     dU = spla.spsolve(K_t_sparse + reg_matrix, Residual)
+
+                # --- ИСПРАВЛЕНИЕ: Ограничение огромных приращений перемещений ---
+                self.max_du = 0.01
+                current_max_du = np.max(np.abs(dU))
+
+                # Если посчитанное перемещение больше заданного лимита
+                if current_max_du > self.max_du:
+                    scale_factor = self.max_du / current_max_du
+                    dU *= scale_factor  # Пропорционально уменьшаем весь вектор
+                    print(f"    [!] Жесткость близка к нулю. Вектор dU масштабирован с коэфф. {scale_factor:.2e}")
 
                 # 5. Обновление
                 U_global += dU
@@ -202,3 +222,178 @@ class StagedNRControl2D(Control):
                 current_u = U_global[self.track_nodes[0].dofs[self.track_dof]]
                 self.history_U.append(current_u)
                 self.history_F.append(rx_force)
+
+    # def solve(self):
+    #     print("\nИнициализация модели и предрасчет кинематики...")
+    #     self.model.initialize()
+    #     self._precompute_topology_and_kinematics()
+    #
+    #     total_dofs = self.model.total_dofs
+    #     U_global = np.zeros(total_dofs)
+    #     V_data = np.zeros(len(self.I_idx))
+    #
+    #     applied_bc_u = [0.0] * len(self.model.bcs)
+    #
+    #     # --- НАСТРОЙКИ АДАПТИВНОГО ШАГА ---
+    #     target_max_factor = self.load_factors[-1] if isinstance(self.load_factors, (list, np.ndarray)) else 1.0
+    #     current_factor = 0.0
+    #
+    #     # Начальный инкремент нагрузки (берем из первого шага пользователя или задаем вручную)
+    #     d_factor = self.load_factors[0] if len(self.load_factors) > 0 else 0.1
+    #     min_d_factor = 1e-6  # Минимально допустимый шаг, чтобы избежать бесконечного цикла
+    #
+    #     step = 1
+    #
+    #     # Главный цикл по нагрузке (пока не достигнем 100% от целевого фактора)
+    #     while current_factor < target_max_factor:
+    #
+    #         # Защита от перелета за максимальную нагрузку
+    #         if current_factor + d_factor > target_max_factor:
+    #             d_factor = target_max_factor - current_factor
+    #
+    #         attempt_factor = current_factor + d_factor
+    #         print(f"\n=== Шаг {step} | Фактор: {attempt_factor:.5f} (Инкремент: {d_factor:.5f}) ===")
+    #
+    #         # СОХРАНЯЕМ СОСТОЯНИЕ ДО ИТЕРАЦИЙ (для возможного отката)
+    #         U_prev = U_global.copy()
+    #         applied_bc_u_prev = list(applied_bc_u)
+    #
+    #         F_ext = np.zeros(total_dofs)
+    #         for load in self.model.nodal_loads:
+    #             dof = load.node.dofs[load.dof_axis]
+    #             is_prop = getattr(load, 'is_proportional', True)
+    #             factor = attempt_factor if is_prop else 1.0
+    #             F_ext[dof] += load.value * factor
+    #
+    #         norm_fext = np.linalg.norm(F_ext[self.free_dofs])
+    #         F_ref = norm_fext if norm_fext > 1e-12 else 1e-6
+    #
+    #         converged = False
+    #
+    #         for iteration in range(self.max_iter):
+    #             V_data.fill(0.0)
+    #             F_int = np.zeros(total_dofs)
+    #             ptr = 0
+    #
+    #             # 1. Сборка K и F_int
+    #             for e_idx, element in enumerate(self.model.elements):
+    #                 el_dofs = self.el_dofs_map[e_idx]
+    #                 U_el = U_global[el_dofs]
+    #                 ndof_e = len(el_dofs)
+    #
+    #                 if self.is_discrete_map[e_idx]:
+    #                     K_e = element.compute_stiffness()
+    #                     F_int_e = element.compute_internal_force(U_el)
+    #                 else:
+    #                     K_e = np.zeros((ndof_e, ndof_e))
+    #                     F_int_e = np.zeros(ndof_e)
+    #                     for ip_idx, ip in enumerate(element.integration_points):
+    #                         B = self.B_map[e_idx][ip_idx]
+    #                         dV = self.dV_map[e_idx][ip_idx]
+    #
+    #                         current_strain = B @ U_el
+    #                         # Важно: update_state не должен сохранять историю внутри себя навсегда до вызова commit()
+    #                         stress, D_ep = ip.constitutive_model.update_state(current_strain)
+    #
+    #                         K_e += B.T @ D_ep @ B * dV
+    #                         F_int_e += B.T @ stress * dV
+    #
+    #                 V_data[ptr:ptr + ndof_e ** 2] = K_e.ravel()
+    #                 ptr += ndof_e ** 2
+    #                 F_int[el_dofs] += F_int_e
+    #
+    #             Residual = F_ext - F_int
+    #
+    #             # 2. Граничные условия
+    #             for bc_idx, bc in enumerate(self.model.bcs):
+    #                 dof = bc.node.dofs[bc.dof_axis]
+    #
+    #                 if iteration == 0:
+    #                     is_prop = getattr(bc, 'is_proportional', True)
+    #                     target_u = (bc.value * attempt_factor) if is_prop else bc.value
+    #                     delta_u = target_u - applied_bc_u[bc_idx]
+    #                     applied_bc_u[bc_idx] = target_u
+    #                 else:
+    #                     delta_u = 0.0
+    #
+    #                 V_data[ptr] = self.PENALTY
+    #                 Residual[dof] = self.PENALTY * delta_u
+    #                 ptr += 1
+    #
+    #             # 3. Сходимость
+    #             norm_res = np.linalg.norm(Residual[self.free_dofs])
+    #             norm_fint = np.linalg.norm(F_int[self.free_dofs])
+    #             F_ref = max(F_ref, norm_fint)
+    #             error = norm_res / F_ref
+    #
+    #             if error < self.tol and iteration > 0:
+    #                 print(f"  -> Сходимость за {iteration} итераций. (Ошибка: {error:.2e})")
+    #                 converged = True
+    #                 break
+    #
+    #             # 4. Решение СЛАУ
+    #             diag_values = V_data[self.I_idx == self.J_idx]
+    #             valid_diag = diag_values[diag_values < self.PENALTY * 0.1]
+    #             max_stiff = np.max(valid_diag) if len(valid_diag) > 0 else 1.0
+    #             reg_value = max_stiff * 1e-4
+    #
+    #             K_t_sparse = sp.coo_matrix((V_data, (self.I_idx, self.J_idx)), shape=(total_dofs, total_dofs)).tocsr()
+    #             reg_matrix = sp.eye(total_dofs) * reg_value
+    #
+    #             try:
+    #                 import warnings
+    #                 with warnings.catch_warnings():
+    #                     warnings.simplefilter("error", spla.MatrixRankWarning)
+    #                     dU = spla.spsolve(K_t_sparse, Residual)
+    #             except Exception as e:
+    #                 diag = K_t_sparse.diagonal()
+    #                 valid_diag = diag[diag < self.PENALTY * 0.1]
+    #                 max_stiff = np.max(valid_diag) if len(valid_diag) > 0 else 1.0
+    #                 reg_matrix = sp.eye(total_dofs) * (max_stiff * 1e-4)
+    #                 dU = spla.spsolve(K_t_sparse + reg_matrix, Residual)
+    #
+    #             # Ограничение огромных приращений перемещений
+    #             self.max_du = 0.00005
+    #             current_max_du = np.max(np.abs(dU))
+    #
+    #             if current_max_du > self.max_du:
+    #                 scale_factor = self.max_du / current_max_du
+    #                 dU *= scale_factor
+    #
+    #                 # 5. Обновление
+    #             U_global += dU
+    #
+    #         # --- ОБРАБОТКА РЕЗУЛЬТАТОВ ШАГА ---
+    #         if converged:
+    #             # 6. Фиксация состояния ТОЛЬКО при успешной сходимости
+    #             current_factor = attempt_factor
+    #             step += 1
+    #
+    #             for element in self.model.elements:
+    #                 if not getattr(element, 'is_spring', False):
+    #                     for ip in element.integration_points:
+    #                         ip.constitutive_model.commit()
+    #
+    #             for node in self.model.nodes:
+    #                 node.displacements = U_global[node.dofs]
+    #
+    #             if self.track_nodes:
+    #                 rx_force = sum(F_int[n.dofs[self.track_dof]] for n in self.track_nodes)
+    #                 current_u = U_global[self.track_nodes[0].dofs[self.track_dof]]
+    #                 self.history_U.append(current_u)
+    #                 self.history_F.append(rx_force)
+    #
+    #             # Если сошлись очень быстро (например, за < 4 итераций), можно увеличить шаг
+    #             if iteration < 4 and current_factor < target_max_factor:
+    #                 d_factor = min(d_factor * 1.5, self.load_factors[0])  # не превышаем начальный шаг
+    #         else:
+    #             # ЕСЛИ НЕ СОШЛИСЬ - ОТКАТЫВАЕМСЯ И ДРОБИМ ШАГ
+    #             print(f"  !!! Сходимость не достигнута. Уменьшаем шаг нагрузки в 2 раза !!!")
+    #             d_factor /= 2.0
+    #             U_global = U_prev
+    #             applied_bc_u = applied_bc_u_prev
+    #
+    #             if d_factor < min_d_factor:
+    #                 print(
+    #                     f"КРИТИЧЕСКАЯ ОШИБКА: Шаг нагрузки стал меньше {min_d_factor}. Дальнейшее решение невозможно.")
+    #                 break

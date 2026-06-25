@@ -15,6 +15,7 @@ import FEM.Integration_Point_Level.CriticalPlane.material as cp_mt
 
 # Импорт решателя
 from FEM.Structure_Level.StagedNRControl2D import StagedNRControl2D
+from FEM.Structure_Level.DisplacementControlNR2D import DisplacementControlNR2D
 
 modelFEM = UbiquitousJointModel2D
 
@@ -79,7 +80,7 @@ def run_masonry_wall_test(sample_name="J4D"):
     0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.400018 0.000000
     0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.900000
                     """
-    A_matrix = cp_mt.load_tensor_from_string(tensor_data) * 1e10
+    A_matrix = cp_mt.load_tensor_from_string(tensor_data) * 1e12
 
     # Параметры материала
     MASONRY_E = 3500e6
@@ -95,24 +96,25 @@ def run_masonry_wall_test(sample_name="J4D"):
         Rcx=MASONRY_RC, Rcy=MASONRY_RC, Rcz=MASONRY_RC
     )
 
-    nq = 8
+    nq = 20
     SIZE_X, SIZE_Y = 1.0, 1.0
     THICKNESS = 0.1
     nx, ny = nq, nq
     area_el = (SIZE_X / nx) * (SIZE_Y / ny)
     char_len = (area_el) ** 0.5
-    n=1
+    # char_len=1
+    n=100
     joint_params = {
-        'phi': 030.0,
+        'phi': 0030.0,
         'psi': 0.0,
-        'phi_r': 010.100,
+        'phi_r': 001.0,
         'cp_material': cp_material,
         'l_c': char_len,
-        'Gf_t': 800.0*n,
-        'Gf_c': 2000.0*n,
-        'Gf_s': 2000.0*n,
-        'a_t': 000.10,
-        'a_s': 00.10,
+        'Gf_t': 0.05*n,
+        'Gf_c': 00.80*n*10,
+        'Gf_s': 00.80*n*10,
+        'a_t': 000.00,
+        'a_s': 00.00,
         'mu': 0.10,
         'fcr_over_fc': 0.10,
         'force_horizontal': True
@@ -134,15 +136,17 @@ def run_masonry_wall_test(sample_name="J4D"):
     # Жесткость пружины. Должна быть достаточно большой, чтобы не вносить
     # паразитных упругих деформаций, но служить стабилизатором.
     # Значение 1e10 Н/м обычно хорошо подходит для бетона/кладки.
-    k_stiffness = 1e10
+    k_stiffness = 1e12
+    k_stiffnessY = 1e10
 
     # Расчет вертикального смещения
     area = SIZE_X * THICKNESS
     stress_y = Fy0 / area
     strain_y = stress_y / MASONRY_E
-    PRE_COMPRESSION_DISP_Y = -strain_y * SIZE_Y
-    # PRE_COMPRESSION_DISP_Y = -0.0005
+    PRE_COMPRESSION_DISP_Y = -strain_y * SIZE_Y*30
+    PRE_COMPRESSION_DISP_Y = -0.0005
     TARGET_DISP_X = 0.004
+
 
     # Итерируемся по КОПИИ списка узлов, так как мы будем добавлять новые узлы в цикле
     for node in list(model.nodes):
@@ -160,7 +164,7 @@ def run_masonry_wall_test(sample_name="J4D"):
             control_nodes.append(ctrl_node)
 
             # 2. Создаем пружинный элемент, связывающий верх стены и контрольный узел
-            spring = SpringElement2D(nodes=[node, ctrl_node], kx=k_stiffness, ky=k_stiffness)
+            spring = SpringElement2D(nodes=[node, ctrl_node], kx=k_stiffness, ky=k_stiffnessY)
             model.elements.append(spring)
 
             # 3. Прикладываем граничные условия к КОНТРОЛЬНОМУ узлу
@@ -172,19 +176,29 @@ def run_masonry_wall_test(sample_name="J4D"):
             model.add_bc(ctrl_node, 1, PRE_COMPRESSION_DISP_Y)
             model.bcs[-1].is_proportional = False
 
+            # # СДЕЛАЙТЕ ТАК:
+            # # Распределяем общую силу Fy0 поровну между всеми верхними контрольными узлами
+            # num_top_nodes = nx + 1
+            # force_per_node = -Fy0 / num_top_nodes
+
+            # Прикладываем силу (is_proportional = False означает, что она действует на 100% с первого шага)
+            # model.add_load(ctrl_node, 1, force_per_node)
+
+            # model.nodal_loads[-1].is_proportional = False
+
     print(f"Добавлено {len(control_nodes)} пружинных элементов.")
     print(f"Сетка обновлена: {len(model.nodes)} узлов, {len(model.elements)} элементов.")
 
     # 50 шагов нагружения до 1.0 (100% от TARGET_DISP_X)
-    load_factors = np.linspace(0, 1.0, 100)[1:]
+    load_factors = np.linspace(0, 1.0, 50)[1:]
 
     control = StagedNRControl2D(
         model=model,
         track_nodes=control_nodes,  # Отслеживаем реакцию на контрольных узлах пружин
         load_factors=load_factors,
         track_dof=0,  # Отслеживаем реакцию по оси X
-        max_iter=50,
-        tol=5e-1
+        max_iter=200,
+        tol=1e-4
     )
 
     control.solve()

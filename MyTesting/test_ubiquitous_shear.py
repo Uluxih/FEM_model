@@ -39,7 +39,7 @@ class FixedPlaneModel(UbiquitousJointModel3D):
         super().__init__(material)
         # Принудительно фиксируем нормаль [0, 0, 1] (ось Z)
         dummy_stress = StressTensor(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        self._lock_plane([0.0, 0.0, 1.0], dummy_stress)
+        self._lock_plane(np.array([0.0, 0.0, 1.0]), dummy_stress)
 
 
 # Назначаем обертку как используемую модель

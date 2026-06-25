@@ -16,8 +16,9 @@ class UbiquitousJointModel2D(ConstitutiveModel):
     """
     2D Ubiquitous-Joint Damage-Plasticity модель.
     Реализован точный аналитический Return Mapping для напряжений.
-    Пластическая работа вычисляется через эффективные напряжения для
-    соответствия алгоритмическому разделению (decoupling) по Minga et al. 2017.
+    Пластическая работа вычисляется через номинальные напряжения для
+    термодинамической согласованности.
+    Реализована алгоритмическая матрица жесткости с опциональной секущей стабилизацией.
     """
 
     def __init__(self, material):
@@ -30,7 +31,7 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         self.E_min = 1e-5 * E
 
         self.phi = np.radians(jp.get('phi', 30.0))
-        self.psi = np.radians(jp.get('psi', 0.0))
+        self.psi = np.radians(jp.get('psi', 10.0))
         self.phi_r = np.radians(jp.get('phi_r', np.degrees(self.phi)))
         self.tan_phi = np.tan(self.phi)
         self.tan_psi = np.tan(self.psi)
@@ -140,15 +141,9 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         self.f_c = max(get_compression_limit(normal, self.cp_material), 1e-12)
         self.c = max(get_cohesion_limit(normal, stress_tensor_3d, self.cp_material), 1e-12)
 
-        # Правильный вывод из уравнений (25) и (26) статьи:
-        term = (1.0 + self.f_t ** 2 / (3.0 * self.E_n * self.Gf_t)) * self.mu
-
-        # H_t должно быть положительным (эффективное упрочнение)
-        if term > 0:
-            self.H_t = self.E_n * (1.0 / term - 1.0)
-        else:
-            self.H_t = self.E_n * 0.1
-        self.H_t=0
+        denom = (1.0 + self.f_t ** 2 / (3.0 * self.E_n * self.Gf_t)) * self.mu - 1.0
+        self.H_t = abs(self.E_n / denom) if denom != 0 else self.E_n * 0.1
+        self.H_t = min(self.H_t, self.E_n * 0.9)
 
         self.q_lim = np.inf if self.tan_phi < 1e-12 else self.c / self.tan_phi - self.f_t
         self.is_locked = True
@@ -175,26 +170,25 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         sig_eff_new = sig_tr.copy()
         dlams = np.zeros(3)
 
-        e_okrugl = 1e-8
-        if F1_tr <= e_okrugl and F2_tr <= e_okrugl and F3_tr <= e_okrugl:
+        if F1_tr <= 1e-12 and F2_tr <= 1e-12 and F3_tr <= 1e-12:
             return sig_eff_new, dlams, 0.0
 
         denom_s = self.G_s + self.E_n * self.tan_phi * self.tan_psi
 
-        if F1_tr > e_okrugl and (abs_tau_tr + ft_curr * self.tan_phi - c_curr) <= e_okrugl:
+        if F1_tr > 1e-12 and (abs_tau_tr + ft_curr * self.tan_phi - c_curr) <= 1e-12:
             dlam_t = F1_tr / (self.E_n + self.H_t)
             m_vec = np.array([1.0, 0.0, 0.0])
             sig_eff_new -= dlam_t * (self.D_local @ m_vec)
             dlams[0] = dlam_t
 
-        elif F3_tr > e_okrugl and (abs_tau_tr - self.f_c * self.tan_phi - c_curr) <= e_okrugl:
+        elif F3_tr > 1e-12 and (abs_tau_tr - self.f_c * self.tan_phi - c_curr) <= 1e-12:
             dlam_c = F3_tr / self.E_n
             m_vec = np.array([-1.0, 0.0, 0.0])
             sig_eff_new -= dlam_c * (self.D_local @ m_vec)
             dlams[1] = dlam_c
 
-        elif (F1_tr > e_okrugl and (abs_tau_tr + ft_curr * self.tan_phi - c_curr > e_okrugl)) or \
-             (F2_tr > e_okrugl and (F1_tr - (F2_tr / denom_s) * self.E_n * self.tan_psi > e_okrugl)):
+        elif (F1_tr > 1e-12 and (abs_tau_tr + ft_curr * self.tan_phi - c_curr > 1e-12)) or \
+             (F2_tr > 1e-12 and (F1_tr - (F2_tr / denom_s) * self.E_n * self.tan_psi > 1e-12)):
             A = np.array([
                 [self.E_n + self.H_t, self.E_n * self.tan_psi],
                 [self.E_n * self.tan_phi, self.G_s + self.E_n * self.tan_phi * self.tan_psi]
@@ -217,8 +211,8 @@ class UbiquitousJointModel2D(ConstitutiveModel):
             dlams[0] = dlam_t
             dlams[2] = dlam_s
 
-        elif (F2_tr > e_okrugl and (F3_tr + (F2_tr / denom_s) * self.E_n * self.tan_psi > e_okrugl)) or \
-             (F3_tr > e_okrugl and (abs_tau_tr - self.f_c * self.tan_phi - c_curr > e_okrugl)):
+        elif (F2_tr > 1e-12 and (F3_tr + (F2_tr / denom_s) * self.E_n * self.tan_psi > 1e-12)) or \
+             (F3_tr > 1e-12 and (abs_tau_tr - self.f_c * self.tan_phi - c_curr > 1e-12)):
             A = np.array([
                 [self.E_n, -self.E_n * self.tan_psi],
                 [-self.E_n * self.tan_phi, self.G_s + self.E_n * self.tan_phi * self.tan_psi]
@@ -241,7 +235,7 @@ class UbiquitousJointModel2D(ConstitutiveModel):
             dlams[1] = dlam_c
             dlams[2] = dlam_s
 
-        elif F2_tr > e_okrugl:
+        elif F2_tr > 1e-12:
             dlam_s = F2_tr / denom_s
             m_vec = np.array([self.tan_psi, 0.0, sign_tau])
             sig_eff_new -= dlam_s * (self.D_local @ m_vec)
@@ -271,34 +265,41 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         else:
             D_s = ds_base
 
-        return min(D_nt, 0.90), min(D_nc, 0.90), min(D_s, 0.90)
+        return min(D_nt, 0.999), min(D_nc, 0.999), min(D_s, 0.999)
 
     def _evaluate_local_stress(self, deps_l):
         # 1. Возврат на поверхность текучести для эффективных напряжений
         sig_eff_new, dlams, dq = self._return_mapping_stress(deps_l)
 
-        # 2. ОЦЕНКА РАБОТЫ ПО MINGA ET AL. (Eq. 15):
-        # Пластическая работа вычисляется строго через ЭФФЕКТИВНЫЕ напряжения.
-        dW_t = max(sig_eff_new[0] * dlams[0], 0.0)
-        dW_c = max(abs(sig_eff_new[0]) * dlams[1], 0.0)
-        dW_s = max((abs(sig_eff_new[2]) + sig_eff_new[0] * self.tan_psi) * dlams[2], 0.0)
+        # 2. Оценка старой поврежденности для развязки расчета работы
+        D_nt_old, D_nc_old, D_s_old = self._calculate_damage(
+            self.W_pl_t_old, self.W_pl_c_old, self.W_pl_s_old, self.q_old, self.sig_eff_old[0]
+        )
+        D_n_old = D_nt_old if sig_eff_new[0] >= 0 else D_nc_old
 
-        # 3. Обновление значений работы и упрочнения
+        # 3. Номинальные напряжения для вычисления пластической работы
+        sig_nom_n = sig_eff_new[0] * (1.0 - D_n_old)
+        sig_nom_s = sig_eff_new[2] * (1.0 - D_s_old)
+
+        # 4. Приращение работы через номинальные напряжения
+        dW_t = max(sig_nom_n * dlams[0], 0.0)
+        dW_c = max(abs(sig_nom_n) * dlams[1], 0.0)
+        dW_s = max((abs(sig_nom_s) + sig_nom_n * self.tan_psi) * dlams[2], 0.0)
+
+        # 5. Обновление значений работы и упрочнения
         W_pl_t = self.W_pl_t_old + dW_t
         W_pl_c = self.W_pl_c_old + dW_c
         W_pl_s = self.W_pl_s_old + dW_s
         q_new = self.q_old + dq
 
-        # 4. Расчет новой поврежденности (напрямую от новой работы)
+        # 6. Расчет новой поврежденности
         D_nt, D_nc, D_s = self._calculate_damage(W_pl_t, W_pl_c, W_pl_s, q_new, sig_eff_new[0])
         D_n = D_nt if sig_eff_new[0] >= 0 else D_nc
 
-        # 5. Итоговые номинальные напряжения
+        # 7. Итоговые номинальные напряжения
         sig_l_nom = sig_eff_new.copy()
         sig_l_nom[0] *= (1.0 - D_n)
         sig_l_nom[2] *= (1.0 - D_s)
-        if dq>0:
-            print(dq)
 
         return sig_l_nom, sig_eff_new, dlams, dq, W_pl_t, W_pl_c, W_pl_s, q_new, D_n, D_s
 
@@ -340,9 +341,7 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         D_s = res[9]
 
         # 2. Построение матриц жесткости (Алгоритмическая Minga 2017)
-        # Поскольку _evaluate_local_stress теперь строго соответствует decoupling,
-        # численная производная автоматически даст корректную матрицу жесткости.
-        h = 1e-14
+        h = 1e-8
         K_ep = np.zeros((3, 3))  # d(sig_eff)/d(eps)
         dD_deps = np.zeros((3, 3))  # d(D)/d(eps)
 
@@ -367,13 +366,14 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         I_minus_D = np.diag([1.0 - D_n, 1.0, 1.0 - D_s])
         K_ed = I_minus_D @ K_ep
 
-        # Точная алгоритмическая матрица
+        # Точная алгоритмическая матрица (может терять положительную определенность)
         K_c_exact = K_ed.copy()
         for i in [0, 2]:
             for j in range(3):
                 K_c_exact[i, j] -= dD_deps[i, j] * sig_eff_new[i]
 
-        # Включение стабилизации (секущая упруго-поврежденная жесткость)
+        # Включение стабилизации (используем секущую упруго-поврежденную жесткость)
+        # Это предотвращает скачки на ветке разупрочнения, стабилизируя решатель Ньютона
         use_secant_stabilization = True
 
         if use_secant_stabilization:
