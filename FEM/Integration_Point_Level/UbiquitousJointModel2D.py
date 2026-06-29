@@ -14,10 +14,9 @@ from FEM.Abstract.Integration_Point_Level import ConstitutiveModel
 
 class UbiquitousJointModel2D(ConstitutiveModel):
     """
-    2D Ubiquitous-Joint Damage-Plasticity модель.
-    Реализован точный аналитический Return Mapping для напряжений.
-    Пластическая работа вычисляется через эффективные напряжения для
-    соответствия алгоритмическому разделению (decoupling) по Minga et al. 2017.
+    2D Ubiquitous-Joint Damage-Plasticity модель с пластичностью матрицы.
+    Матрица: Идеальная пластичность Друкера-Прагера (2D сглаженный Мор-Кулон).
+    Трещина: Точный аналитический Return Mapping с поврежденностью (Minga et al. 2017).
     """
 
     def __init__(self, material):
@@ -26,6 +25,15 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         E = self.material.E
         nu = self.material.nu
         jp = self.material.joint_params
+
+        # Параметры матрицы (Друкер-Прагер)
+        mp = getattr(self.material, 'matrix_params', {})
+        self.phi_m = np.radians(mp.get('phi', 30.0))
+        self.psi_m = np.radians(mp.get('psi', 0.0))
+        self.c_m = mp.get('c', 1e6)
+        self.sin_phi_m = np.sin(self.phi_m)
+        self.cos_phi_m = np.cos(self.phi_m)
+        self.sin_psi_m = np.sin(self.psi_m)
 
         self.E_min = 1e-5 * E
 
@@ -46,7 +54,7 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         self.preset_plane_normal = jp.get('preset_plane_normal', None)
         self.force_horizontal = jp.get('force_horizontal', False)
         if self.force_horizontal:
-            self.preset_plane_normal = np.array([0.0, 1.0, 0])
+            self.preset_plane_normal = np.array([0.0, 1.0, 0.0])
 
         self.l_c = jp.get('l_c', 1.0)
         self.Gf_t = jp.get('Gf_t', 1.0) / self.l_c
@@ -55,7 +63,7 @@ class UbiquitousJointModel2D(ConstitutiveModel):
 
         self.a_t = jp.get('a_t', 1.0)
         self.a_s = jp.get('a_s', 1.0)
-        self.mu = jp.get('mu', 0.1)
+        self.mu = self.tan_phi
         self.fcr_over_fc = jp.get('fcr_over_fc', 0.0)
 
         self.D_rock = self._build_plane_stress_stiffness(E, nu)
@@ -72,6 +80,8 @@ class UbiquitousJointModel2D(ConstitutiveModel):
 
         self.f_t = self.f_c = self.c = self.q_lim = self.H_t = 0.0
 
+        self.cp_material.mu = self.tan_phi
+
         self._init_history()
 
     def _init_history(self):
@@ -79,6 +89,12 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         self.eps_p_old = np.zeros(3)
         self.q_old = 0.0
         self.W_pl_t_old = self.W_pl_c_old = self.W_pl_s_old = 0.0
+
+        # ДОБАВЛЕНО: История повреждений
+        self.D_nt_old = 0.0
+        self.D_nc_old = 0.0
+        self.D_s_old = 0.0
+
         self.stress_old = np.zeros(3)
         self.strain_old = np.zeros(3)
         self.stress = np.zeros(3)
@@ -92,6 +108,11 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         self.W_pl_t_trial = self.W_pl_t_old
         self.W_pl_c_trial = self.W_pl_c_old
         self.W_pl_s_trial = self.W_pl_s_old
+
+        # ДОБАВЛЕНО: Сброс trial-значений повреждений
+        self.D_nt_trial = self.D_nt_old
+        self.D_nc_trial = self.D_nc_old
+        self.D_s_trial = self.D_s_old
 
     def _build_plane_stress_stiffness(self, E, nu):
         D = np.zeros((3, 3))
@@ -121,6 +142,7 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         return T_sig, T_eps
 
     def _lock_plane(self, normal, stress_tensor_3d):
+        print('locked')
         nx, ny = normal[0], normal[1]
         norm = np.hypot(nx, ny)
         if norm < 1e-12:
@@ -140,15 +162,14 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         self.f_c = max(get_compression_limit(normal, self.cp_material), 1e-12)
         self.c = max(get_cohesion_limit(normal, stress_tensor_3d, self.cp_material), 1e-12)
 
-        # Правильный вывод из уравнений (25) и (26) статьи:
+        print('locked', self.c)
+
         term = (1.0 + self.f_t ** 2 / (3.0 * self.E_n * self.Gf_t)) * self.mu
 
-        # H_t должно быть положительным (эффективное упрочнение)
         if term > 0:
             self.H_t = self.E_n * (1.0 / term - 1.0)
         else:
             self.H_t = self.E_n * 0.1
-        self.H_t=0
 
         self.q_lim = np.inf if self.tan_phi < 1e-12 else self.c / self.tan_phi - self.f_t
         self.is_locked = True
@@ -157,10 +178,49 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         if q <= self.q_lim: return self.c
         return self.c + (q - self.q_lim) * self.tan_phi
 
-    def _return_mapping_stress(self, deps_l):
-        sig_tr = self.sig_eff_old + self.D_local @ deps_l
-        sn_tr = sig_tr[0]
-        tau_tr = sig_tr[2]
+    def _return_mapping_matrix(self, sig_tr):
+        p_tr = 0.5 * (sig_tr[0] + sig_tr[1])
+        sx = 0.5 * (sig_tr[0] - sig_tr[1])
+        txy = sig_tr[2]
+        q_tr = np.hypot(sx, txy)
+
+        F_tr = q_tr + p_tr * self.sin_phi_m - self.c_m * self.cos_phi_m
+
+        if F_tr <= 1e-10:
+            return sig_tr.copy()
+
+        K_2D = 0.5 * (self.D_rock[0, 0] + self.D_rock[0, 1])
+        G = self.D_rock[2, 2]
+
+        denom = G + K_2D * self.sin_phi_m * self.sin_psi_m
+        dlam = F_tr / denom
+
+        p_new = p_tr - K_2D * self.sin_psi_m * dlam
+        q_new = q_tr - G * dlam
+
+        p_apex = self.c_m * self.cos_phi_m / (self.sin_phi_m + 1e-12) if self.sin_phi_m > 1e-12 else np.inf
+
+        if q_new < 0 or p_new > p_apex:
+            p_new = p_apex
+            q_new = 0.0
+
+        sig_mat = np.zeros(3)
+        if q_tr > 1e-12:
+            sx_new = sx * (q_new / q_tr)
+            txy_new = txy * (q_new / q_tr)
+        else:
+            sx_new = 0.0
+            txy_new = 0.0
+
+        sig_mat[0] = p_new + sx_new
+        sig_mat[1] = p_new - sx_new
+        sig_mat[2] = txy_new
+
+        return sig_mat
+
+    def _return_mapping_stress(self, sig_tr_local):
+        sn_tr = sig_tr_local[0]
+        tau_tr = sig_tr_local[2]
 
         abs_tau_tr = abs(tau_tr)
         sign_tau = 1.0 if tau_tr >= 0 else -1.0
@@ -172,7 +232,7 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         F3_tr = -sn_tr - self.f_c
         F2_tr = abs_tau_tr + sn_tr * self.tan_phi - c_curr
 
-        sig_eff_new = sig_tr.copy()
+        sig_eff_new = sig_tr_local.copy()
         dlams = np.zeros(3)
 
         e_okrugl = 1e-8
@@ -194,7 +254,7 @@ class UbiquitousJointModel2D(ConstitutiveModel):
             dlams[1] = dlam_c
 
         elif (F1_tr > e_okrugl and (abs_tau_tr + ft_curr * self.tan_phi - c_curr > e_okrugl)) or \
-             (F2_tr > e_okrugl and (F1_tr - (F2_tr / denom_s) * self.E_n * self.tan_psi > e_okrugl)):
+                (F2_tr > e_okrugl and (F1_tr - (F2_tr / denom_s) * self.E_n * self.tan_psi > e_okrugl)):
             A = np.array([
                 [self.E_n + self.H_t, self.E_n * self.tan_psi],
                 [self.E_n * self.tan_phi, self.G_s + self.E_n * self.tan_phi * self.tan_psi]
@@ -218,7 +278,7 @@ class UbiquitousJointModel2D(ConstitutiveModel):
             dlams[2] = dlam_s
 
         elif (F2_tr > e_okrugl and (F3_tr + (F2_tr / denom_s) * self.E_n * self.tan_psi > e_okrugl)) or \
-             (F3_tr > e_okrugl and (abs_tau_tr - self.f_c * self.tan_phi - c_curr > e_okrugl)):
+                (F3_tr > e_okrugl and (abs_tau_tr - self.f_c * self.tan_phi - c_curr > e_okrugl)):
             A = np.array([
                 [self.E_n, -self.E_n * self.tan_psi],
                 [-self.E_n * self.tan_phi, self.G_s + self.E_n * self.tan_phi * self.tan_psi]
@@ -271,15 +331,15 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         else:
             D_s = ds_base
 
-        return min(D_nt, 0.90), min(D_nc, 0.90), min(D_s, 0.90)
+        return min(D_nt, 0.990), min(D_nc, 0.990), min(D_s, 0.990)
 
-    def _evaluate_local_stress(self, deps_l):
+    def _evaluate_local_stress(self, sig_tr_local):
         # 1. Возврат на поверхность текучести для эффективных напряжений
-        sig_eff_new, dlams, dq = self._return_mapping_stress(deps_l)
+        sig_eff_new, dlams, dq = self._return_mapping_stress(sig_tr_local)
 
-        # 2. ОЦЕНКА РАБОТЫ ПО MINGA ET AL. (Eq. 15):
-        # Пластическая работа вычисляется строго через ЭФФЕКТИВНЫЕ напряжения.
-        dW_t = max(sig_eff_new[0] * dlams[0], 0.0)
+        # 2. ОЦЕНКА РАБОТЫ ПО MINGA ET AL.
+        sig_n_yield_start = self.f_t + self.q_old
+        dW_t = max(0.5 * (sig_n_yield_start + sig_eff_new[0]) * dlams[0], 0.0)
         dW_c = max(abs(sig_eff_new[0]) * dlams[1], 0.0)
         dW_s = max((abs(sig_eff_new[2]) + sig_eff_new[0] * self.tan_psi) * dlams[2], 0.0)
 
@@ -289,113 +349,126 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         W_pl_s = self.W_pl_s_old + dW_s
         q_new = self.q_old + dq
 
-        # 4. Расчет новой поврежденности (напрямую от новой работы)
-        D_nt, D_nc, D_s = self._calculate_damage(W_pl_t, W_pl_c, W_pl_s, q_new, sig_eff_new[0])
+        # 4. Расчет новой поврежденности (текущие значения)
+        D_nt_calc, D_nc_calc, D_s_calc = self._calculate_damage(W_pl_t, W_pl_c, W_pl_s, q_new, sig_eff_new[0])
+
+        # ДОБАВЛЕНО: Принудительная монотонность повреждения. Повреждение не может уменьшаться!
+        D_nt = max(D_nt_calc, self.D_nt_old)
+        D_nc = max(D_nc_calc, self.D_nc_old)
+        D_s = max(D_s_calc, self.D_s_old)
+
         D_n = D_nt if sig_eff_new[0] >= 0 else D_nc
 
         # 5. Итоговые номинальные напряжения
         sig_l_nom = sig_eff_new.copy()
         sig_l_nom[0] *= (1.0 - D_n)
         sig_l_nom[2] *= (1.0 - D_s)
-        if dq>0:
-            print(dq)
 
-        return sig_l_nom, sig_eff_new, dlams, dq, W_pl_t, W_pl_c, W_pl_s, q_new, D_n, D_s
+        # Возвращаем все D отдельно
+        return sig_l_nom, sig_eff_new, dlams, dq, W_pl_t, W_pl_c, W_pl_s, q_new, D_nt, D_nc, D_s
+
+    def _compute_stress_state(self, deps_global):
+        # Шаг 1: Матрица
+        sig_tr_global = self.stress_old + self.D_rock @ deps_global
+        sig_mat_global = self._return_mapping_matrix(sig_tr_global)
+
+        # Если трещина не активирована
+        if not self.is_locked:
+            # Возвращаем нули для всех 11 элементов
+            return sig_mat_global, sig_mat_global, np.zeros(3), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+        # Шаг 2: Трещина. Пробным напряжением служит локальная проекция напряжения матрицы
+        sig_tr_local = self.T_sig @ sig_mat_global
+        res = self._evaluate_local_stress(sig_tr_local)
+
+        sig_l_nom = res[0]
+        sig_global_nom = self.T_eps.T @ sig_l_nom
+
+        return (sig_global_nom, *res[1:])
+
+    def _compute_tangent_numerical(self, deps_global):
+        h = 1e-8
+        D_tangent = np.zeros((3, 3))
+        for j in range(3):
+            deps_pos = deps_global.copy()
+            deps_pos[j] += h
+            sig_pos = self._compute_stress_state(deps_pos)[0]
+
+            deps_neg = deps_global.copy()
+            deps_neg[j] -= h
+            sig_neg = self._compute_stress_state(deps_neg)[0]
+
+            D_tangent[:, j] = (sig_pos - sig_neg) / (2.0 * h)
+        return D_tangent
 
     def update_state(self, current_strain_voigt):
         self.strain = current_strain_voigt.copy()
         self._reset_trial()
 
+        deps_global = self.strain - self.strain_old
+
+        # Предварительная оценка матрицы для поиска критической плоскости
+        sig_tr_global = self.stress_old + self.D_rock @ deps_global
+        sig_mat_global = self._return_mapping_matrix(sig_tr_global)
+
         if not self.is_locked:
-            sig_tr = self.stress_old + self.D_rock @ (self.strain - self.strain_old)
-            sig_tr_3d = np.array([sig_tr[0], sig_tr[1], 0.0, sig_tr[2], 0.0, 0.0])
+            sig_tr_3d = np.array([sig_mat_global[0], sig_mat_global[1], 0.0, sig_mat_global[2], 0.0, 0.0])
             st = StressTensor(*sig_tr_3d)
 
             if self.preset_plane_normal is not None:
+                print("Трещина образовалась по заданному нормальному вектору (Preset)")
                 self._lock_plane(self.preset_plane_normal, st)
             else:
-                f_s, n_s, u_s = find_critical_plane_shear(st, self.cp_material, self.cp_num_planes)
-                f_t, n_t, u_t = find_critical_plane_tensile(st, self.cp_material, self.cp_num_planes)
-                f_c, n_c, u_c = find_critical_plane_compression(st, self.cp_material, self.cp_num_planes)
+                f_s, n_s, u_s = find_critical_plane_shear(st, self.cp_material)
+                f_t, n_t, u_t = find_critical_plane_tensile(st, self.cp_material)
+                f_c, n_c, u_c = find_critical_plane_compression(st, self.cp_material)
 
                 max_f = max(f_s, f_t, f_c)
                 if self.lock_on_yield and max_f <= 1e-10:
-                    self.stress = sig_tr
-                    self.D_tangent = self.D_rock.copy()
+                    # Течет только матрица (или упругость)
+                    self.stress = sig_mat_global
+                    self.D_tangent = self._compute_tangent_numerical(deps_global)
                     return self.stress.copy(), self.D_tangent
                 else:
                     max_u = max(u_s, u_t, u_c)
-                    best_n = n_s if max_u == u_s else (n_t if max_u == u_t else n_c)
+                    if max_u == u_s:
+                        best_n = n_s
+                        print("Трещина образовалась по режиму: СДВИГ")
+                    elif max_u == u_t:
+                        best_n = n_t
+                        print("Трещина образовалась по режиму: РАСТЯЖЕНИЕ")
+                    else:
+                        best_n = n_c
+                        print("Трещина образовалась по режиму: СЖАТИЕ")
+
                     self._lock_plane(best_n, st)
 
-        deps_global = self.strain - self.strain_old
-        deps_l = self.T_eps @ deps_global
+        # 1. Получение текущего состояния (Матрица + Трещина)
+        res = self._compute_stress_state(deps_global)
+        self.stress = res[0]
 
-        # 1. Получение текущего состояния
-        res = self._evaluate_local_stress(deps_l)
-        sig_l_nom = res[0]
-        sig_eff_new = res[1]
+        # 2. Построение матрицы жесткости численно
+        self.D_tangent = self._compute_tangent_numerical(deps_global)
+
+        # 3. Сохранение Trial-значений
+        self.sig_eff_trial = res[1]
         dlams = res[2]
-        D_n = res[8]
-        D_s = res[9]
 
-        # 2. Построение матриц жесткости (Алгоритмическая Minga 2017)
-        # Поскольку _evaluate_local_stress теперь строго соответствует decoupling,
-        # численная производная автоматически даст корректную матрицу жесткости.
-        h = 1e-14
-        K_ep = np.zeros((3, 3))  # d(sig_eff)/d(eps)
-        dD_deps = np.zeros((3, 3))  # d(D)/d(eps)
-
-        for j in range(3):
-            # Вперед
-            deps_pos = deps_l.copy()
-            deps_pos[j] += h
-            res_pos = self._evaluate_local_stress(deps_pos)
-
-            # Назад
-            deps_neg = deps_l.copy()
-            deps_neg[j] -= h
-            res_neg = self._evaluate_local_stress(deps_neg)
-
-            # Центральные разности
-            K_ep[:, j] = (res_pos[1] - res_neg[1]) / (2.0 * h)
-            dD_deps[0, j] = (res_pos[8] - res_neg[8]) / (2.0 * h)
-            dD_deps[1, j] = 0.0
-            dD_deps[2, j] = (res_pos[9] - res_neg[9]) / (2.0 * h)
-
-        # Матрица (I - D) * K_ep
-        I_minus_D = np.diag([1.0 - D_n, 1.0, 1.0 - D_s])
-        K_ed = I_minus_D @ K_ep
-
-        # Точная алгоритмическая матрица
-        K_c_exact = K_ed.copy()
-        for i in [0, 2]:
-            for j in range(3):
-                K_c_exact[i, j] -= dD_deps[i, j] * sig_eff_new[i]
-
-        # Включение стабилизации (секущая упруго-поврежденная жесткость)
-        use_secant_stabilization = True
-
-        if use_secant_stabilization:
-            K_local_tangent = K_ed
-        else:
-            K_local_tangent = K_c_exact
-
-        # 3. Трансформация обратно в глобальные координаты
-        self.stress = self.T_eps.T @ sig_l_nom
-        self.D_tangent = self.T_eps.T @ K_local_tangent @ self.T_eps
-
-        # 4. Сохранение Trial-значений
-        self.sig_eff_trial = sig_eff_new
+        # ИСПРАВЛЕНО: q_trial должен брать q_new (res[7]), а не dq (res[3])
         self.q_trial = res[7]
         self.W_pl_t_trial = res[4]
         self.W_pl_c_trial = res[5]
         self.W_pl_s_trial = res[6]
 
+        # Сохранение trial-повреждений
+        self.D_nt_trial = res[8]
+        self.D_nc_trial = res[9]
+        self.D_s_trial = res[10]
+
         self.eps_p_trial = self.eps_p_old + np.array([
             dlams[0] - dlams[1] + dlams[2] * self.tan_psi,
             0,
-            dlams[2] * (1.0 if sig_eff_new[2] >= 0 else -1.0)
+            dlams[2] * (1.0 if self.sig_eff_trial[2] >= 0 else -1.0)
         ])
 
         return self.stress.copy(), self.D_tangent
@@ -411,7 +484,13 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         self.strain_old = self.strain.copy()
         self.sig_eff_old = self.sig_eff_trial.copy()
         self.eps_p_old = self.eps_p_trial.copy()
+
         self.q_old = self.q_trial
         self.W_pl_t_old = self.W_pl_t_trial
         self.W_pl_c_old = self.W_pl_c_trial
         self.W_pl_s_old = self.W_pl_s_trial
+
+        # ДОБАВЛЕНО: Обновление старых значений повреждений
+        self.D_nt_old = self.D_nt_trial
+        self.D_nc_old = self.D_nc_trial
+        self.D_s_old = self.D_s_trial

@@ -7,11 +7,11 @@ import FEM.Integration_Point_Level.CriticalPlane.material as mt
 # ==========================================
 # ДОБАВЛЕНО: Функция вычисления вектора нормали
 # ==========================================
-def get_normal_vector(params, mode='3D'):
+def get_normal_vector(params, mode='2D_XY'):
     """
     Преобразует угловые параметры в единичный вектор нормали.
     В 3D: params = [theta, phi] (полярный и азимутальный углы)
-    В 2D_XZ: params = theta (угол в плоскости XZ)
+    В 2D_XY: params = theta (угол в плоскости XY относительно оси X)
     """
     if mode == '3D':
         theta, phi = params[0], params[1]
@@ -19,12 +19,12 @@ def get_normal_vector(params, mode='3D'):
         ny = np.sin(theta) * np.sin(phi)
         nz = np.cos(theta)
         return np.array([nx, ny, nz])
-    elif mode == '2D_XZ':
+    elif mode == '2D_XY':
         # Обработка случая, когда params передается как список [theta] или как число theta
         theta = params[0] if isinstance(params, (list, tuple, np.ndarray)) else params
-        nx = np.sin(theta)
-        ny = 0.0
-        nz = np.cos(theta)
+        nx = np.cos(theta)
+        ny = np.sin(theta)
+        nz = 0.0
         return np.array([nx, ny, nz])
     else:
         raise ValueError(f"Неизвестный режим: {mode}")
@@ -33,11 +33,11 @@ def get_normal_vector(params, mode='3D'):
 # ==========================================
 # НОВЫЙ БЛОК: ГЕНЕРАЦИЯ ДИСКРЕТНЫХ ПЛОЩАДОК (ОПТИМИЗАЦИЯ)
 # ==========================================
-def generate_discrete_params(num_planes, mode='3D'):
+def generate_discrete_params(num_planes, mode='2D_XY'):
     """
     Генерирует равномерно распределенный набор параметров (углов) для поиска.
     Для 3D используется алгоритм сферы Фибоначчи для равномерного покрытия сферы.
-    Для 2D_XZ - равномерное распределение по полуокружности.
+    Для 2D_XY - равномерное распределение по полуокружности.
     """
     params_list = []
     if mode == '3D':
@@ -55,7 +55,7 @@ def generate_discrete_params(num_planes, mode='3D'):
             phi = (i * phi_golden) % (2 * np.pi)
             params_list.append([theta, phi])
 
-    elif mode == '2D_XZ':
+    elif mode == '2D_XY':
         for i in range(num_planes):
             theta = i * np.pi / num_planes
             params_list.append([theta])
@@ -87,6 +87,7 @@ def get_cohesion_limit(n, stress_tensor: StressTensor, material: mt.Material):
         s_geom = stress_tensor.shear_stress_vector(n) / tau_n
     else:
         # Выбираем произвольное направление, ортогональное нормали
+        # Для плоскости XY n[2] всегда 0, так что это условие отработает идеально
         if abs(n[2]) < 0.9:
             s_geom = np.cross(n, np.array([0, 0, 1]))
         else:
@@ -99,7 +100,7 @@ def get_cohesion_limit(n, stress_tensor: StressTensor, material: mt.Material):
 # ==========================================
 # 1. КРИТЕРИЙ СДВИГА
 # ==========================================
-def calculate_criterion_shear(params, stress_tensor, material: mt.Material, mode='3D'):
+def calculate_criterion_shear(params, stress_tensor, material: mt.Material, mode='2D_XY'):
     n = get_normal_vector(params, mode)
     sigma_n = stress_tensor.normal_stress(n)
     tau_n = stress_tensor.shear_stress_magnitude(n)
@@ -107,17 +108,21 @@ def calculate_criterion_shear(params, stress_tensor, material: mt.Material, mode
     # Используем новую отдельную функцию вычисления сцепления
     C_val = get_cohesion_limit(n, stress_tensor, material)
 
-    # Сопротивление сдвигу
+    # Сопротивление сдвигу (закон Кулона-Мора)
+    # Сжатие - отрицательно (sigma_n < 0), поэтому мы ВЫЧИТАЕМ sigma_n, чтобы сопротивление РОСЛО
     if sigma_n > 0:
-        resistance = C_val + material.mu_tensile * sigma_n
+        # При растяжении сопротивление падает. Ограничиваем нулем, чтобы не получить отрицательный предел
+        # ИСПРАВЛЕНО: используем material.mu вместо material.mu_tensile (или коэффициента 0.4)
+        resistance = max(0.0, C_val - material.mu * sigma_n)
     else:
-        resistance = C_val + material.mu * sigma_n
+        # При сжатии (sigma_n <= 0) сопротивление растет
+        resistance = C_val - material.mu * sigma_n
 
     f_val = tau_n - resistance
     return f_val, n, tau_n, resistance
 
 
-def find_critical_plane_shear(stress_tensor, material, mode='3D', num_planes=5):
+def find_critical_plane_shear(stress_tensor, material, mode='2D_XY', num_planes=5):
     best_params = None
     max_f = -float('inf')
 
@@ -143,7 +148,7 @@ def find_critical_plane_shear(stress_tensor, material, mode='3D', num_planes=5):
 # ==========================================
 # 2. КРИТЕРИЙ РАСТЯЖЕНИЯ
 # ==========================================
-def calculate_criterion_tensile(params, stress_tensor, material, mode='3D'):
+def calculate_criterion_tensile(params, stress_tensor, material, mode='2D_XY'):
     n = get_normal_vector(params, mode)
     sigma_n = stress_tensor.normal_stress(n)
 
@@ -154,7 +159,7 @@ def calculate_criterion_tensile(params, stress_tensor, material, mode='3D'):
     return f_val, n, sigma_n, Rp_n
 
 
-def find_critical_plane_tensile(stress_tensor, material, mode='3D', num_planes=5):
+def find_critical_plane_tensile(stress_tensor, material, mode='2D_XY', num_planes=5):
     best_params = None
     max_f = -float('inf')
 
@@ -179,7 +184,7 @@ def find_critical_plane_tensile(stress_tensor, material, mode='3D', num_planes=5
 # ==========================================
 # 3. КРИТЕРИЙ СЖАТИЯ
 # ==========================================
-def calculate_criterion_compression(params, stress_tensor, material, mode='3D'):
+def calculate_criterion_compression(params, stress_tensor, material, mode='2D_XY'):
     n = get_normal_vector(params, mode)
     sigma_n = stress_tensor.normal_stress(n)
 
@@ -190,7 +195,7 @@ def calculate_criterion_compression(params, stress_tensor, material, mode='3D'):
     return f_val, n, sigma_n, Rc_n
 
 
-def find_critical_plane_compression(stress_tensor, material, mode='3D', num_planes=5):
+def find_critical_plane_compression(stress_tensor, material, mode='2D_XY', num_planes=5):
     best_params = None
     max_f = -float('inf')
 

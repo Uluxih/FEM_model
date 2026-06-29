@@ -10,7 +10,7 @@ class Solid2DModel(AnalysisModel):
     3 компоненты деформации, 2 перемещения на узел.
     """
 
-    def __init__(self, thickness=1.0):
+    def __init__(self, thickness=01.0):
         """
         Инициализация 2D модели.
         :param thickness: Толщина элемента (t). Для плоской деформации обычно t=1.0.

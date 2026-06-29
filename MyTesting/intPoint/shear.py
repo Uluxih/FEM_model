@@ -18,17 +18,17 @@ class RockMaterial(BaseMaterial):
 
 
 # Матрица анизотропии для критической плоскости
-A_matrix = np.eye(9) * (0.9e6) ** 2
+A_matrix = np.eye(9) * (0.3e6) ** 2
 
 cp_mat = CPMaterial(
-    mu=-0.3,
+    mu=-0.2,
     A_tensor=A_matrix,
-    Rpx=0.5e6, Rpy=0.5e6, Rpz=0.5e6,
+    Rpx=0.7e6, Rpy=0.7e6, Rpz=0.7e6,
     Rcx=12.0e6, Rcy=12.0e6, Rcz=12.0e6,
 )
 
 joint_parameters = {
-    'phi': 20.0,
+    'phi': 050.0,
     'psi': 0.0,
     'phi_r': 0.0,
 
@@ -44,7 +44,7 @@ joint_parameters = {
 
     'mu': 0.1,
 
-    'fcr_over_fc': 0.0,
+    'fcr_over_fc': 0.5,
 }
 
 material = RockMaterial(E=3500e6, nu=0.2, joint_params=joint_parameters)
@@ -77,7 +77,7 @@ print("=" * 60)
 # =====================================================================
 # 3. ШАГ 1: НОРМАЛЬНОЕ ОБЖАТИЕ (вдоль оси Y)
 # =====================================================================
-eps_yy_comp = -0.00001
+eps_yy_comp = 0.0001
 strain_comp = np.zeros(3)  # Voigt 2D: [xx, yy, xy]
 strain_comp[1] = eps_yy_comp
 
@@ -98,7 +98,7 @@ print(f"  γ_el  (τ_ref / G)         = {gamma_elastic * 1e3:.4f} ×10⁻³")
 # 4. ШАГ 2: ЦИКЛИЧЕСКОЕ СДВИГОВОЕ НАГРУЖЕНИЕ (компонента xy)
 #    Полная деформация: [0, eps_yy, gamma_xy]
 # =====================================================================
-gamma_max = gamma_elastic
+gamma_max = gamma_elastic*5
 N_fwd = 80
 N_back = 160
 N_ret = 80
