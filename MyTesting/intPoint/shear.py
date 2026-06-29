@@ -35,9 +35,9 @@ joint_parameters = {
     'cp_material': cp_mat,
 
     'l_c': 0.05,
-    'Gf_t': 20.0,
-    'Gf_c': 800.0,
-    'Gf_s': 200.0,
+    'Gf_t': 2.0,
+    'Gf_c': 8.0,
+    'Gf_s': 8.0,
 
     'a_t': 0.0,
     'a_s': 0.0,
@@ -98,7 +98,7 @@ print(f"  γ_el  (τ_ref / G)         = {gamma_elastic * 1e3:.4f} ×10⁻³")
 # 4. ШАГ 2: ЦИКЛИЧЕСКОЕ СДВИГОВОЕ НАГРУЖЕНИЕ (компонента xy)
 #    Полная деформация: [0, eps_yy, gamma_xy]
 # =====================================================================
-gamma_max = gamma_elastic*5
+gamma_max = gamma_elastic*10
 N_fwd = 80
 N_back = 160
 N_ret = 80

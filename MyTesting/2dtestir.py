@@ -83,50 +83,50 @@ def run_masonry_wall_test(sample_name="J4D"):
 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 -0.000000 0.525625 0.000000
 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.266944
                     """
-    A_matrix = cp_mt.load_tensor_from_string(tensor_data) * 1e12 * 9.0
+    A_matrix = cp_mt.load_tensor_from_string(tensor_data) * 1e12 * 8.0
 
     # Параметры материала
     MASONRY_E = 3500e6
     MASONRY_NU = 0.2
     MASONRY_MU = 0.577
-    MASONRY_RP = 000.5e6
+    MASONRY_RP = 01.7e6
     MASONRY_RC = 12.0e6
 
     cp_material = cp_mt.Material(
         mu=MASONRY_MU,
         A_tensor=A_matrix,
-        Rpx=MASONRY_RP, Rpy=MASONRY_RP * 1.5, Rpz=MASONRY_RP * 1.5,
-        Rcx=MASONRY_RC, Rcy=MASONRY_RC * 1.0, Rcz=MASONRY_RC * 1.0
+        Rpx=MASONRY_RP*1.0, Rpy=MASONRY_RP * 0.7, Rpz=MASONRY_RP * 1.0,
+        Rcx=MASONRY_RC*0.75, Rcy=MASONRY_RC * 1.0, Rcz=MASONRY_RC * 1.0
     )
 
-    nq = 6
+    nq = 5
     SIZE_X, SIZE_Y = 1.0, 1.0
     THICKNESS = 0.10
     nx, ny = nq, nq
     area_el = (SIZE_X / nx) * (SIZE_Y / ny)
     char_len = (area_el) ** 0.5
-    n = 1000
+    n = 0.5
 
     # Параметры ослабленной плоскости (трещины)
     joint_params = {
         'phi': 030.0,
         'psi': 0.0,
-        'phi_r': 0.0,
+        'phi_r': 01.0,
         'cp_material': cp_material,
         'l_c': char_len,
-        'Gf_t': 0.05 * n,
-        'Gf_c': 0.40 * n,
-        'Gf_s': 0.40 * n,
-        'a_t': 0.100,
-        'a_s': 0.100,
+        'Gf_t': 1000*n,
+        'Gf_c': 400*n,
+        'Gf_s': 2500*n,
+        'a_t': 01.00,
+        'a_s': 01.00,
         'mu': 0.10,
-        'fcr_over_fc': 0.40
+        'fcr_over_fc': 0.10
     }
 
     # Параметры целого материала (матрицы) для Друкера-Прагера
     # Вы можете корректировать их в зависимости от прочности вашей кладки на сжатие/срез
     matrix_params = {
-        'c': 01.3000e6,  # Сцепление матрицы (Па)
+        'c': 001.3500e6,  # Сцепление матрицы (Па)
         'phi': 30.0,  # Угол внутреннего трения матрицы (градусы)
         'psi': 0.0  # Угол дилатансии матрицы (градусы)
     }
@@ -154,7 +154,7 @@ def run_masonry_wall_test(sample_name="J4D"):
     k_stiffness = 1e12
     k_stiffnessY = 1e7
 
-    TARGET_DISP_X = 0.0106
+    TARGET_DISP_X = 0.01
 
     # Расчет общей вертикальной силы на 2D модель (модель единичной толщины)
     # Знак минус, так как сила направлена вниз (сжатие вдоль Y)
@@ -239,4 +239,4 @@ def run_masonry_wall_test(sample_name="J4D"):
 
 
 if __name__ == "__main__":
-    run_masonry_wall_test("J7D")
+    run_masonry_wall_test("J4D")
