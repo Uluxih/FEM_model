@@ -378,20 +378,23 @@ class UbiquitousJointModel2D(ConstitutiveModel):
 
         return (sig_global_nom, *res[1:])
 
-    def _evaluate_stress_state(self, current_strain_voigt):
+    def _evaluate_stress_state(self, current_strain_voigt, is_perturbation=False):
         """
-        Внутренний метод: вычисляет напряжения и обновляет trial-переменные состояния
-        для заданного вектора деформаций.
+        is_perturbation=True означает, что это расчет для численного Якобиана.
+        В этом режиме мы НЕ перезаписываем переменные состояния (trial) и НЕ ищем плоскость.
         """
-        self.strain = current_strain_voigt.copy()
-        self._reset_trial()
+        if not is_perturbation:
+            self.strain = current_strain_voigt.copy()
+            self._reset_trial()
 
-        deps_global = self.strain - self.strain_old
+        # Приращение деформаций считаем от переданного вектора
+        deps_global = current_strain_voigt - self.strain_old
 
         sig_tr_global = self.stress_old + self.D_rock @ deps_global
         sig_mat_global = self._return_mapping_matrix(sig_tr_global)
 
-        if not self.is_locked_trial:
+        # ПОИСК ПЛОСКОСТИ: делаем ТОЛЬКО на базовом шаге
+        if not self.is_locked_trial and not is_perturbation:
             sig_tr_3d = np.array([sig_mat_global[0], sig_mat_global[1], 0.0, sig_mat_global[2], 0.0, 0.0])
             st = StressTensor(*sig_tr_3d)
 
@@ -404,8 +407,7 @@ class UbiquitousJointModel2D(ConstitutiveModel):
 
                 max_f = max(f_s, f_t, f_c)
                 if self.lock_on_yield and max_f <= 1e-10:
-                    self.stress = sig_mat_global
-                    return self.stress.copy()
+                    pass  # Трещина не образовалась
                 else:
                     max_u = max(u_s, u_t, u_c)
                     if max_u == u_s:
@@ -417,58 +419,52 @@ class UbiquitousJointModel2D(ConstitutiveModel):
 
                     self._lock_plane(best_n, st)
 
+        # Вычисляем напряжения
         res = self._compute_stress_state(deps_global)
-        self.stress = res[0]
+        stress_result = res[0]
 
-        self.sig_eff_trial = res[1]
-        dlams = res[2]
-        self.q_trial = res[7]
-        self.W_pl_t_trial = res[4]
-        self.W_pl_c_trial = res[5]
-        self.W_pl_s_trial = res[6]
+        # СОХРАНЕНИЕ ПЕРЕМЕННЫХ: делаем ТОЛЬКО на базовом шаге
+        if not is_perturbation:
+            self.stress = stress_result
+            self.sig_eff_trial = res[1]
+            dlams = res[2]
+            self.q_trial = res[7]
+            self.W_pl_t_trial = res[4]
+            self.W_pl_c_trial = res[5]
+            self.W_pl_s_trial = res[6]
 
-        self.D_nt_trial = res[8]
-        self.D_nc_trial = res[9]
-        self.D_s_trial = res[10]
+            self.D_nt_trial = res[8]
+            self.D_nc_trial = res[9]
+            self.D_s_trial = res[10]
 
-        self.D_n_trial = self.D_nt_trial if self.sig_eff_trial[0] >= 0 else self.D_nc_trial
+            self.D_n_trial = self.D_nt_trial if self.sig_eff_trial[0] >= 0 else self.D_nc_trial
 
-        self.eps_p_trial = self.eps_p_old + np.array([
-            dlams[0] - dlams[1] + dlams[2] * self.tan_psi,
-            0,
-            dlams[2] * (1.0 if self.sig_eff_trial[2] >= 0 else -1.0)
-        ])
+            self.eps_p_trial = self.eps_p_old + np.array([
+                dlams[0] - dlams[1] + dlams[2] * self.tan_psi,
+                0,
+                dlams[2] * (1.0 if self.sig_eff_trial[2] >= 0 else -1.0)
+            ])
 
-        return self.stress.copy()
+        return stress_result
 
     def update_state(self, current_strain_voigt):
-        """
-        Обновляет состояние и рассчитывает согласованную алгоритмическую матрицу
-        жесткости (Algorithmic Tangent Stiffness Matrix) численным методом.
-        """
-        # 1. Вычисляем базовое напряженное состояние
-        stress_base = self._evaluate_stress_state(current_strain_voigt)
+        # 1. Базовый шаг: ищет плоскость (если нужно) и сохраняет trial-переменные
+        stress_base = self._evaluate_stress_state(current_strain_voigt, is_perturbation=False)
 
-        # 2. Численное вычисление Якобиана (D_algo = d_sigma / d_eps)
-        # Пример центральной разности (если потребуется идеальная точность)
+        # 2. Численное вычисление Якобиана
         D_algo = np.zeros((3, 3))
         perturbation = 1e-8
 
         for i in range(3):
-            # Возмущение +
-            strain_plus = current_strain_voigt.copy()
-            strain_plus[i] += perturbation
-            stress_plus = self._evaluate_stress_state(strain_plus)
+            strain_perturbed = current_strain_voigt.copy()
+            strain_perturbed[i] += perturbation
 
-            # Возмущение -
-            strain_minus = current_strain_voigt.copy()
-            strain_minus[i] -= perturbation
-            stress_minus = self._evaluate_stress_state(strain_minus)
-            D_algo[:, i] = (stress_plus - stress_minus) / (2.0 * perturbation)
+            # Возмущение: вызываем с флагом True (работает очень быстро, ничего не перезаписывает)
+            stress_perturbed = self._evaluate_stress_state(strain_perturbed, is_perturbation=True)
 
-        # 3. Восстанавливаем внутренние trial-состояния для базовых деформаций,
-        # так как возмущения могли их изменить.
-        self._evaluate_stress_state(current_strain_voigt)
+            D_algo[:, i] = (stress_perturbed - stress_base) / perturbation
+
+        # 3. Пятый вызов больше не нужен! Состояние объекта осталось корректным.
 
         self.D_tangent = D_algo
         return self.stress.copy(), self.D_tangent
