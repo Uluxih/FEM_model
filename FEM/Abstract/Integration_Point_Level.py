@@ -9,7 +9,6 @@ class Material(ABC):
         self.E = E
         self.nu = nu
 
-
 class ConstitutiveModel(ABC):
     """Базовый класс для определяющих соотношений (упругость, пластичность и т.д.)"""
 
