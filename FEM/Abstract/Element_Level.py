@@ -79,7 +79,6 @@ class Element(ABC):
 
         return K
 
-
 class ElementFactory(ABC):
     """
     Абстрактная фабрика конечных элементов.

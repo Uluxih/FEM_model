@@ -83,14 +83,14 @@ def run_masonry_wall_test(sample_name="J4D"):
 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 -0.000000 0.525625 0.000000
 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.266944
                     """
-    A_matrix = cp_mt.load_tensor_from_string(tensor_data) * 1e12 * 8.0
+    A_matrix = cp_mt.load_tensor_from_string(tensor_data) * 1e12 * 4.0
 
     # Параметры материала
     MASONRY_E = 3500e6
     MASONRY_NU = 0.2
     MASONRY_MU = 0.577
-    MASONRY_RP = 01.75e6
-    MASONRY_RC = 12.0e6
+    MASONRY_RP = 00.75e6
+    MASONRY_RC = 12.000e6
 
     cp_material = cp_mt.Material(
         mu=MASONRY_MU,
@@ -99,24 +99,24 @@ def run_masonry_wall_test(sample_name="J4D"):
         Rcx=MASONRY_RC*0.75, Rcy=MASONRY_RC * 1.0, Rcz=MASONRY_RC * 1.0
     )
 
-    nq = 10
+    nq = 2
     SIZE_X, SIZE_Y = 1.0, 1.0
     THICKNESS = 0.10
     nx, ny = nq, nq
     area_el = (SIZE_X / nx) * (SIZE_Y / ny)
     char_len = (area_el) ** 0.5
-    n = 0.25
+    n = 1
 
     # Параметры ослабленной плоскости (трещины)
     joint_params = {
         'phi': 030.0,
         'psi': 0.0,
-        'phi_r': 01.0,
+        'phi_r': 0.0,
         'cp_material': cp_material,
         'l_c': char_len,
-        'Gf_t': 1000*n,
-        'Gf_c': 4000*n,
-        'Gf_s': 2500*n,
+        'Gf_t': 400*n,
+        'Gf_c': 1000*n,
+        'Gf_s': 1000*n,
         'a_t': 01.00,
         'a_s': 01.00,
         'mu': 0.10,
@@ -126,7 +126,7 @@ def run_masonry_wall_test(sample_name="J4D"):
     # Параметры целого материала (матрицы) для Друкера-Прагера
     # Вы можете корректировать их в зависимости от прочности вашей кладки на сжатие/срез
     matrix_params = {
-        'c': 001.3500e6,  # Сцепление матрицы (Па)
+        'c': 000.700e6,  # Сцепление матрицы (Па)
         'phi': 30.0,  # Угол внутреннего трения матрицы (градусы)
         'psi': 0.0  # Угол дилатансии матрицы (градусы)
     }
@@ -199,7 +199,7 @@ def run_masonry_wall_test(sample_name="J4D"):
     print(f"Сетка обновлена: {len(model.nodes)} узлов, {len(model.elements)} элементов.")
 
     # 50 шагов нагружения до 1.0 (100% от TARGET_DISP_X)
-    load_factors = np.linspace(0, 1.0, 100)[1:]
+    load_factors = np.linspace(0, 1.0, 50)[1:]
 
     control = StagedNRControl2D(
         model=model,
@@ -207,7 +207,7 @@ def run_masonry_wall_test(sample_name="J4D"):
         load_factors=load_factors,
         track_dof=0,  # Отслеживаем реакцию по оси X
         max_iter=20,
-        tol=5e-4
+        tol=5e-3
     )
 
     control.solve()

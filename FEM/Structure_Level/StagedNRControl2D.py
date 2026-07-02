@@ -318,5 +318,5 @@ class StagedNRControl2D(Control):
                     print("Дальнейшее решение невозможно. Остановка.")
                     break
         # ДОБАВЛЕНО: Генерация Excel файла после завершения всего расчета
-        # self.mat_logger.save_to_excel("material_history.xlsx")
+        self.mat_logger.save_to_excel("material_history.xlsx")
 

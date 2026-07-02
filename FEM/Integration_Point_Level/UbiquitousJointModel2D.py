@@ -165,6 +165,7 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         self.f_t = max(get_tensile_limit(normal, self.cp_material), 1e-12)
         self.f_c = max(get_compression_limit(normal, self.cp_material), 1e-12)
         self.c = max(get_cohesion_limit(normal, stress_tensor_3d, self.cp_material), 1e-12)
+        print(self.c,'lock')
 
         term = (1.0 + self.f_t ** 2 / (3.0 * self.E_n * self.Gf_t)) * self.mu
         if term > 0:
@@ -333,7 +334,7 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         else:
             D_s = ds_base
 
-        return min(D_nt, 0.990), min(D_nc, 0.990), min(D_s, 0.990)
+        return min(D_nt, 0.80), min(D_nc, 0.990), min(D_s, 0.990)
 
     def _evaluate_local_stress(self, sig_tr_local):
         sig_eff_new, dlams, dq = self._return_mapping_stress(sig_tr_local)
@@ -360,7 +361,26 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         sig_l_nom[0] *= (1.0 - D_n)
         sig_l_nom[2] *= (1.0 - D_s)
 
+        # 1. Деградация самой трещины (нормаль и сдвиг)
+        sig_l_nom[0] *= (1.0 - D_n)
+        sig_l_nom[2] *= (1.0 - D_s)
+
+        # 2. ДЕГРАДАЦИЯ МАТРИЦЫ ВДОЛЬ ТРЕЩИНЫ (Ваша идея)
+        # Берем максимальное повреждение шва
+        D_parallel = max(D_n, D_s)
+
+        # Задаем предел: насколько сильно может разрушиться матрица вдоль шва?
+        # Например, 0.90 означает, что останется 10% прочности.
+        max_matrix_damage = 0.55
+
+        # Применяем лимит
+        D_parallel_eff = min(D_parallel, max_matrix_damage)
+
+        # Сбрасываем напряжение вдоль трещины
+        sig_l_nom[1] *= (1.0 - D_parallel_eff)
+
         return sig_l_nom, sig_eff_new, dlams, dq, W_pl_t, W_pl_c, W_pl_s, q_new, D_nt, D_nc, D_s
+
 
     def _compute_stress_state(self, deps_global):
         sig_tr_global = self.stress_old + self.D_rock @ deps_global
@@ -378,23 +398,47 @@ class UbiquitousJointModel2D(ConstitutiveModel):
 
         return (sig_global_nom, *res[1:])
 
-    def _evaluate_stress_state(self, current_strain_voigt, is_perturbation=False):
-        """
-        is_perturbation=True означает, что это расчет для численного Якобиана.
-        В этом режиме мы НЕ перезаписываем переменные состояния (trial) и НЕ ищем плоскость.
-        """
-        if not is_perturbation:
-            self.strain = current_strain_voigt.copy()
-            self._reset_trial()
+    def _compute_secant_matrix(self):
+        if not self.is_locked_trial:
+            return self.D_rock.copy()
 
-        # Приращение деформаций считаем от переданного вектора
-        deps_global = current_strain_voigt - self.strain_old
+        D_sec_local = self.D_local.copy()
+
+        # Минимальная жесткость для глобального решателя (защита от расходимости)
+        min_stiff = 0.05
+
+        f_n = max(1.0 - getattr(self, 'D_n_trial', 0.0), min_stiff)
+        f_s = max(1.0 - getattr(self, 'D_s_trial', 0.0), min_stiff)
+
+        # Жесткость матрицы вдоль трещины падает так же, как и напряжения
+        D_parallel_trial = max(getattr(self, 'D_n_trial', 0.0), getattr(self, 'D_s_trial', 0.0))
+        max_matrix_damage = 0.90  # Тот же предел, что и в напряжениях
+        f_p = max(1.0 - min(D_parallel_trial, max_matrix_damage), min_stiff)
+
+        # Применяем деградацию по диагоналям локальной матрицы (без извлечения корня!)
+        D_sec_local[0, :] *= f_n
+        D_sec_local[:, 0] *= f_n
+
+        D_sec_local[1, :] *= f_p
+        D_sec_local[:, 1] *= f_p
+
+        D_sec_local[2, :] *= f_s
+        D_sec_local[:, 2] *= f_s
+
+        D_sec_global = self.T_eps.T @ D_sec_local @ self.T_eps
+        return D_sec_global
+
+    def update_state(self, current_strain_voigt):
+        self.strain = current_strain_voigt.copy()
+        self._reset_trial()
+
+        deps_global = self.strain - self.strain_old
 
         sig_tr_global = self.stress_old + self.D_rock @ deps_global
         sig_mat_global = self._return_mapping_matrix(sig_tr_global)
 
-        # ПОИСК ПЛОСКОСТИ: делаем ТОЛЬКО на базовом шаге
-        if not self.is_locked_trial and not is_perturbation:
+        # Проверяем критерий только если трещина еще не зафиксирована пробным флагом
+        if not self.is_locked_trial:
             sig_tr_3d = np.array([sig_mat_global[0], sig_mat_global[1], 0.0, sig_mat_global[2], 0.0, 0.0])
             st = StressTensor(*sig_tr_3d)
 
@@ -407,66 +451,48 @@ class UbiquitousJointModel2D(ConstitutiveModel):
 
                 max_f = max(f_s, f_t, f_c)
                 if self.lock_on_yield and max_f <= 1e-10:
-                    pass  # Трещина не образовалась
+                    self.stress = sig_mat_global
+                    self.D_tangent = self._compute_secant_matrix()
+                    return self.stress.copy(), self.D_tangent
                 else:
                     max_u = max(u_s, u_t, u_c)
                     if max_u == u_s:
                         best_n = n_s
+                        print("Трещина образовалась по режиму: СДВИГ")
                     elif max_u == u_t:
                         best_n = n_t
+                        print("Трещина образовалась по режиму: РАСТЯЖЕНИЕ")
                     else:
                         best_n = n_c
+                        print("Трещина образовалась по режиму: СЖАТИЕ")
 
+                    # Установит is_locked_trial = True, но если на след. итерации деформации упадут - она исчезнет!
                     self._lock_plane(best_n, st)
 
-        # Вычисляем напряжения
         res = self._compute_stress_state(deps_global)
-        stress_result = res[0]
+        self.stress = res[0]
 
-        # СОХРАНЕНИЕ ПЕРЕМЕННЫХ: делаем ТОЛЬКО на базовом шаге
-        if not is_perturbation:
-            self.stress = stress_result
-            self.sig_eff_trial = res[1]
-            dlams = res[2]
-            self.q_trial = res[7]
-            self.W_pl_t_trial = res[4]
-            self.W_pl_c_trial = res[5]
-            self.W_pl_s_trial = res[6]
+        self.sig_eff_trial = res[1]
+        dlams = res[2]
+        self.q_trial = res[7]
+        self.W_pl_t_trial = res[4]
+        self.W_pl_c_trial = res[5]
+        self.W_pl_s_trial = res[6]
 
-            self.D_nt_trial = res[8]
-            self.D_nc_trial = res[9]
-            self.D_s_trial = res[10]
+        self.D_nt_trial = res[8]
+        self.D_nc_trial = res[9]
+        self.D_s_trial = res[10]
 
-            self.D_n_trial = self.D_nt_trial if self.sig_eff_trial[0] >= 0 else self.D_nc_trial
+        self.D_n_trial = self.D_nt_trial if self.sig_eff_trial[0] >= 0 else self.D_nc_trial
 
-            self.eps_p_trial = self.eps_p_old + np.array([
-                dlams[0] - dlams[1] + dlams[2] * self.tan_psi,
-                0,
-                dlams[2] * (1.0 if self.sig_eff_trial[2] >= 0 else -1.0)
-            ])
+        self.D_tangent = self._compute_secant_matrix()
 
-        return stress_result
+        self.eps_p_trial = self.eps_p_old + np.array([
+            dlams[0] - dlams[1] + dlams[2] * self.tan_psi,
+            0,
+            dlams[2] * (1.0 if self.sig_eff_trial[2] >= 0 else -1.0)
+        ])
 
-    def update_state(self, current_strain_voigt):
-        # 1. Базовый шаг: ищет плоскость (если нужно) и сохраняет trial-переменные
-        stress_base = self._evaluate_stress_state(current_strain_voigt, is_perturbation=False)
-
-        # 2. Численное вычисление Якобиана
-        D_algo = np.zeros((3, 3))
-        perturbation = 1e-8
-
-        for i in range(3):
-            strain_perturbed = current_strain_voigt.copy()
-            strain_perturbed[i] += perturbation
-
-            # Возмущение: вызываем с флагом True (работает очень быстро, ничего не перезаписывает)
-            stress_perturbed = self._evaluate_stress_state(strain_perturbed, is_perturbation=True)
-
-            D_algo[:, i] = (stress_perturbed - stress_base) / perturbation
-
-        # 3. Пятый вызов больше не нужен! Состояние объекта осталось корректным.
-
-        self.D_tangent = D_algo
         return self.stress.copy(), self.D_tangent
 
     def get_tangent_matrix(self):
