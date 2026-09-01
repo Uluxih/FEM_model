@@ -104,15 +104,17 @@ for eps_yy in loading_path:
     sig_history.append(stress[1])  # σ_yy
 
     # Извлекаем текущий нормальный damage D_n
+    # (эффективное напряжение в локальных осях трещины; индекс 0 — нормальная компонента)
+    sig_eff_loc = model.T_sig @ model.sig_eff_glob_old
     D_nt_val, D_nc_val, _ = model._calculate_damage(
-        model.W_pl_t_old, model.W_pl_c_old, model.W_pl_s_old, model.q_old, model.sig_eff_old[0]
+        model.W_pl_t_old, model.W_pl_c_old, model.W_pl_s_old, model.q_old, sig_eff_loc[0]
     )
     # Так как у нас растяжение, активен растягивающий damage D_nt
-    D_n_val = D_nt_val if model.sig_eff_old[0] >= 0 else D_nc_val
+    D_n_val = D_nt_val if sig_eff_loc[0] >= 0 else D_nc_val
     D_n_history.append(D_n_val)
 
-    # Пластическая деформация (нормальная компонента — индекс 0 в eps_p)
-    eps_p_history.append(model.eps_p_old[0])
+    # Суммарная пластическая деформация (матрица + шов), компонента yy (нагружение по ε_yy)
+    eps_p_history.append(model.eps_p_total[1])
 
 eps_arr = np.array(eps_history)
 sig_arr = np.array(sig_history)

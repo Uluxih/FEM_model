@@ -41,9 +41,6 @@ class Material:
         self.Rcy = Rcy if Rcy is not None else 1e9
         self.Rcz = Rcz if Rcz is not None else 1e9
 
-        # Внутренние константы (понижение трения при растяжении)
-        self.mu_tensile = -0.4
-
 
 
     def get_cohesion(self, n, s):

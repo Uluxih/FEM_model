@@ -1,3 +1,4 @@
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -55,8 +56,9 @@ def generate_rect_mesh(Lx, Ly, nx, ny, material, factory):
     return model
 
 
-def run_masonry_wall_test(sample_name="J4D"):
+def run_masonry_wall_test(sample_name="J4D", nq=10, show_plot=True, tangent_mode='secant'):
     print(f"=== ТЕСТ: Сдвиговая стена 2D в осях X-Y (Валидация по образцу {sample_name}) ===")
+    print(f"Сетка: {nq} x {nq} элементов")
 
     # Словарь экспериментальных данных (Fz0 переименовано в Fy0)
     exp_data = {
@@ -73,60 +75,61 @@ def run_masonry_wall_test(sample_name="J4D"):
     expected_peak = exp_data[sample_name]["peak_Fx"]
 
     tensor_data = """
-0.266944 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
-0.000000 0.202500 -0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
-0.000000 -0.000000 0.202500 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
-0.000000 0.000000 0.000000 0.239842 0.000000 -0.000000 0.000000 0.000000 0.000000
-0.000000 0.000000 0.000000 0.000000 0.266944 0.000000 0.000000 0.000000 0.000000
-0.000000 0.000000 0.000000 -0.000000 0.000000 0.059960 0.000000 0.000000 0.000000
-0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.525625 -0.000000 0.000000
-0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 -0.000000 0.525625 0.000000
-0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.266944
+1777777777777.777588 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+0.000000 1959999987937.882080 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+0.000000 0.000000 1959999987917.281494 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+0.000000 0.000000 0.000000 1439999991091.858643 0.000000 0.000000 0.000000 0.000000 0.000000
+0.000000 0.000000 0.000000 0.000000 1777777777777.777588 0.000000 0.000000 0.000000 0.000000
+0.000000 0.000000 0.000000 0.000000 0.000000 1439999990978.519775 0.000000 0.000000 0.000000
+0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 1959999987877.562744 0.000000 0.000000
+0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 1959999987877.562988 0.000000
+0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000 1777777777777.777588
                     """
-    A_matrix = cp_mt.load_tensor_from_string(tensor_data) * 1e12 * 4.0
+    # A_matrix = cp_mt.load_tensor_from_string(tensor_data) * 1e12 * 5.6
+    A_matrix = cp_mt.load_tensor_from_string(tensor_data)*1.0
 
     # Параметры материала
     MASONRY_E = 3500e6
     MASONRY_NU = 0.2
     MASONRY_MU = 0.577
-    MASONRY_RP = 00.75e6
-    MASONRY_RC = 12.000e6
+    MASONRY_RP = 001.00e6
+    MASONRY_RC = 12.0e6
 
     cp_material = cp_mt.Material(
         mu=MASONRY_MU,
         A_tensor=A_matrix,
-        Rpx=MASONRY_RP*1.0, Rpy=MASONRY_RP * 0.7, Rpz=MASONRY_RP * 1.0,
+        Rpx=MASONRY_RP*0.70, Rpy=MASONRY_RP * 0.5, Rpz=MASONRY_RP * 0.70,
         Rcx=MASONRY_RC*0.75, Rcy=MASONRY_RC * 1.0, Rcz=MASONRY_RC * 1.0
     )
 
-    nq = 2
     SIZE_X, SIZE_Y = 1.0, 1.0
     THICKNESS = 0.10
     nx, ny = nq, nq
     area_el = (SIZE_X / nx) * (SIZE_Y / ny)
     char_len = (area_el) ** 0.5
-    n = 1
 
     # Параметры ослабленной плоскости (трещины)
     joint_params = {
+        # 'tangent_mode': 'numerical',
+        'tangent_mode': tangent_mode,
         'phi': 030.0,
         'psi': 0.0,
-        'phi_r': 0.0,
+        'phi_r': 24.0,
         'cp_material': cp_material,
         'l_c': char_len,
-        'Gf_t': 400*n,
-        'Gf_c': 1000*n,
-        'Gf_s': 1000*n,
-        'a_t': 01.00,
-        'a_s': 01.00,
-        'mu': 0.10,
+        'Gf_t': 80,
+        'Gf_c': 3000,
+        'Gf_s': 800,
+        'a_t': 0.100,
+        'a_s': 0.00,
+        'mu': 0.20,  # доля остаточной деформации трещины (damage-plasticity split), НЕ трение
         'fcr_over_fc': 0.10
     }
 
     # Параметры целого материала (матрицы) для Друкера-Прагера
     # Вы можете корректировать их в зависимости от прочности вашей кладки на сжатие/срез
     matrix_params = {
-        'c': 000.700e6,  # Сцепление матрицы (Па)
+        'c': 001.400e6,  # Сцепление матрицы (Па)
         'phi': 30.0,  # Угол внутреннего трения матрицы (градусы)
         'psi': 0.0  # Угол дилатансии матрицы (градусы)
     }
@@ -151,51 +154,70 @@ def run_masonry_wall_test(sample_name="J4D"):
     max_node_id = max(node.id for node in model.nodes)
 
     # Жесткость пружины
-    k_stiffness = 1e12
-    k_stiffnessY = 1e7
+    k_stiffness = 1e12  # горизонтальная (для управления сдвигом)
+    k_stiffnessY = 1e8  # СУММАРНАЯ вертикальная жесткость "пружин обжатия"
 
-    TARGET_DISP_X = 0.005
+    TARGET_DISP_X = 0.004
 
-    # Расчет общей вертикальной силы на 2D модель (модель единичной толщины)
-    # Знак минус, так как сила направлена вниз (сжатие вдоль Y)
-    Fy_2D_total = -Fy0 / THICKNESS
+    # --- Формула (86): корректировка вертикальной силы под жесткость пружины ---
+    K_wall_axial = MASONRY_E * SIZE_X * THICKNESS / SIZE_Y  # E0*lx*t/ly
+    Fy_corrected = Fy0 * (1 + k_stiffnessY * SIZE_Y / (MASONRY_E * SIZE_X * THICKNESS))
 
-    # Итерируемся по КОПИИ списка узлов
+    Fy_2D_total = -Fy_corrected / THICKNESS
+
     for node in list(model.nodes):
-        # Нижняя грань (y = 0) - жестко защемлена
         if abs(node.coords[1] - 0.0) < 1e-6:
-            model.add_bc(node, 0, 0.0)  # X
-            model.add_bc(node, 1, 0.0)  # Y (индекс 1 в 2D)
+            model.add_bc(node, 0, 0.0)
+            model.add_bc(node, 1, 0.0)
 
-        # Верхняя грань (y = SIZE_Y) - передаем нагрузку
         elif abs(node.coords[1] - SIZE_Y) < 1e-6:
-
-            # --- 1. ПРИЛОЖЕНИЕ ВЕРТИКАЛЬНОЙ СИЛЫ К УЗЛУ КЛАДКИ ---
-            # Распределяем вертикальную силу: на крайние узлы половина, на внутренние полная доля
             if abs(node.coords[0] - 0.0) < 1e-6 or abs(node.coords[0] - SIZE_X) < 1e-6:
                 nodal_force = Fy_2D_total / (2 * nx)
+                k_node_y = k_stiffnessY / (2 * nx)
             else:
                 nodal_force = Fy_2D_total / nx
+                k_node_y = k_stiffnessY / nx
 
-            # Вертикальное обжатие по Y через СИЛУ в узел кладки (Не пропорциональное)
+                # Вертикальная сила (с учетом поправки на жесткость пружины)
             model.add_load(node, 1, nodal_force)
             model.nodal_loads[-1].is_proportional = False
 
-            # --- 2. ДОБАВЛЕНИЕ ПРУЖИНЫ И ГОРИЗОНТАЛЬНОГО ПЕРЕМЕЩЕНИЯ ---
             max_node_id += 1
             ctrl_node = Node(max_node_id, node.coords.copy())
             model.nodes.append(ctrl_node)
             control_nodes.append(ctrl_node)
 
-            # Создаем пружинный элемент
-            spring = SpringElement2D(nodes=[node, ctrl_node], kx=k_stiffness, ky=k_stiffnessY)
+            # Пружина стоит ПАРАЛЛЕЛЬНО стене: kx - управляющая (сдвиг), ky - "к земле"
+            spring = SpringElement2D(nodes=[node, ctrl_node], kx=k_stiffness, ky=k_node_y)
             model.elements.append(spring)
 
-            # Горизонтальный сдвиг по X через пружину (Пропорциональный)
+            # ВАЖНО: заземляем вертикальный DOF ctrl_node, иначе ky ни на что не влияет
+            model.add_bc(ctrl_node, 1, 0.0)
+
+            # Горизонтальный сдвиг по X через пружину (пропорциональный)
             model.add_bc(ctrl_node, 0, TARGET_DISP_X)
             model.bcs[-1].is_proportional = True
 
+    # =========================================================================
+    # ЖЁСТКАЯ БАЛКА ПО ВЕРХУ СТЕНЫ
+    # Соседние узлы верхней кромки соединяются очень жёсткими связями (штрафной
+    # подход): верх стены перемещается как жёсткое тело, вертикальные
+    # перемещения всех верхних узлов уравниваются. Нагрузки прикладываются
+    # к узлам балки (это те же верхние узлы стены).
+    # =========================================================================
+    control_ids = {n.id for n in control_nodes}
+    top_nodes = sorted(
+        [node for node in model.nodes
+         if abs(node.coords[1] - SIZE_Y) < 1e-6 and node.id not in control_ids],
+        key=lambda n: n.coords[0]
+    )
+    k_beam = 1e13  # жёсткость связей балки (на ~4 порядка выше жёсткости стены)
+    for n1, n2 in zip(top_nodes[:-1], top_nodes[1:]):
+        beam_link = SpringElement2D(nodes=[n1, n2], kx=k_beam, ky=k_beam)
+        model.elements.append(beam_link)
+
     print(f"Добавлено {len(control_nodes)} пружинных элементов.")
+    print(f"Добавлена жёсткая балка: {len(top_nodes) - 1} связей между {len(top_nodes)} верхними узлами.")
     print(f"Сетка обновлена: {len(model.nodes)} узлов, {len(model.elements)} элементов.")
 
     # 50 шагов нагружения до 1.0 (100% от TARGET_DISP_X)
@@ -206,11 +228,23 @@ def run_masonry_wall_test(sample_name="J4D"):
         track_nodes=control_nodes,
         load_factors=load_factors,
         track_dof=0,  # Отслеживаем реакцию по оси X
-        max_iter=20,
-        tol=5e-3
+        max_iter=50,
+        tol=1e-2
     )
+    print(f"[TEST CONFIG] nq={nq}, l_c={char_len:.5f}, springs={len(control_nodes)}")
+    sys.stdout.flush()
 
     control.solve()
+
+    # Отчёт о развитии трещин и критериях разрушения (консоль + Excel)
+    control.mat_logger.print_summary()
+    control.mat_logger.save_to_excel(f"material_log_{sample_name}.xlsx")
+
+    # Проверка работы жёсткой балки: разброс вертикальных перемещений верха стены
+    uy_top = [node.displacements[1] for node in top_nodes]
+    print(f"Перемещения uy верха стены: min = {min(uy_top) * 1000:.4f} мм, "
+          f"max = {max(uy_top) * 1000:.4f} мм, "
+          f"разброс = {(max(uy_top) - min(uy_top)) * 1000:.3e} мм")
 
     # Извлечение данных для графика
     ux_mm = [u * 1000 for u in control.history_U]
@@ -235,8 +269,14 @@ def run_masonry_wall_test(sample_name="J4D"):
     plt.grid(True, linestyle=':', alpha=0.7)
     plt.legend(loc='lower right')
     plt.tight_layout()
-    plt.show()
+    if show_plot:
+        plt.show()
+    else:
+        plt.savefig(f"wall_curve_{sample_name}_nq{nq}.png", dpi=150)
+    plt.close()
+
+    return control, fx_kN, ux_mm
 
 
 if __name__ == "__main__":
-    run_masonry_wall_test("J4D")
+    run_masonry_wall_test("J7D")

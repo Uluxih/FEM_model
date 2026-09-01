@@ -107,12 +107,13 @@ def calculate_criterion_shear(params, stress_tensor, material: mt.Material, mode
 
     # Используем новую отдельную функцию вычисления сцепления
     C_val = get_cohesion_limit(n, stress_tensor, material)
+    # print(C_val)
 
     # Сопротивление сдвигу (закон Кулона-Мора)
     # Сжатие - отрицательно (sigma_n < 0), поэтому мы ВЫЧИТАЕМ sigma_n, чтобы сопротивление РОСЛО
     if sigma_n > 0:
         # При растяжении сопротивление падает. Ограничиваем нулем, чтобы не получить отрицательный предел
-        # ИСПРАВЛЕНО: используем material.mu вместо material.mu_tensile (или коэффициента 0.4)
+        # material.mu — единый коэффициент трения для критерия Кулона-Мора
         resistance = max(0.0, C_val - material.mu * sigma_n)
     else:
         # При сжатии (sigma_n <= 0) сопротивление растет
