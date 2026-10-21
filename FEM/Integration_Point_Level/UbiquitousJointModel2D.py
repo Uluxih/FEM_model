@@ -11,6 +11,14 @@ from FEM.Integration_Point_Level.CriticalPlane.criterion import (
 )
 from FEM.Integration_Point_Level.CriticalPlane.tensor import StressTensor
 from FEM.Abstract.Integration_Point_Level import ConstitutiveModel
+from FEM.Integration_Point_Level._uj2d_numba import (
+    rm_matrix_kernel,
+    rm_stress_kernel,
+    damage_kernel,
+    apply_damage_kernel,
+    evaluate_joint_kernel,
+    secant_locked_kernel,
+)
 
 
 class UbiquitousJointModel2D(ConstitutiveModel):
@@ -264,75 +272,12 @@ class UbiquitousJointModel2D(ConstitutiveModel):
             deps_p_mat  — приращение пластической деформации матрицы (глобальные оси),
             D_ep        — эласто-пластический тангенс матрицы (континуальный);
                           упругий D_rock, если поверхность текучести не достигнута.
+        Вычисления — в Numba-JIT ядре (_uj2d_numba.rm_matrix_kernel),
+        формулы идентичны исходной NumPy-реализации.
         """
-        p_tr = 0.5 * (sig_tr[0] + sig_tr[1])
-        sx = 0.5 * (sig_tr[0] - sig_tr[1])
-        txy = sig_tr[2]
-        q_tr = np.hypot(sx, txy)
-
-        F_tr = q_tr + p_tr * self.sin_phi_m - self.c_m * self.cos_phi_m
-        if F_tr <= 1e-10:
-            return sig_tr.copy(), np.zeros(3), self.D_rock.copy()
-
-        K_2D = 0.5 * (self.D_rock[0, 0] + self.D_rock[0, 1])
-        G = self.D_rock[2, 2]
-
-        denom = G + K_2D * self.sin_phi_m * self.sin_psi_m
-        dlam = F_tr / denom
-
-        p_new = p_tr - K_2D * self.sin_psi_m * dlam
-        q_new = q_tr - G * dlam
-
-        p_apex = (self.c_m * self.cos_phi_m / self.sin_phi_m
-                  if self.sin_phi_m > 1e-12 else np.inf)
-
-        at_apex = False
-        if q_new < 0 or p_new > p_apex:
-            p_new = min(p_apex, p_tr)
-            q_new = 0.0
-            at_apex = True
-
-        sig_mat = np.zeros(3)
-        if q_tr > 1e-12:
-            sx_new = sx * (q_new / q_tr)
-            txy_new = txy * (q_new / q_tr)
-        else:
-            sx_new = 0.0
-            txy_new = 0.0
-
-        sig_mat[0] = p_new + sx_new
-        sig_mat[1] = p_new - sx_new
-        sig_mat[2] = txy_new
-
-        # Приращение пластической деформации матрицы, согласованное с возвратом
-        # напряжений: deps_p = D^{-1} (sig_tr - sig_mat)
-        deps_p_mat = self.D_rock_inv @ (sig_tr - sig_mat)
-
-        # Континуальный эласто-пластический тангенс Друкера-Прагера:
-        # D_ep = D - (D m)(D n)^T / (n^T D m),  n = dF/dsig, m = dg/dsig
-        if not at_apex and q_new > 1e-12:
-            c_dev = 0.5 * sx_new / q_new
-            s_dev = txy_new / q_new
-            n_vec = np.array([c_dev + 0.5 * self.sin_phi_m,
-                              -c_dev + 0.5 * self.sin_phi_m,
-                              s_dev])
-            m_vec = np.array([c_dev + 0.5 * self.sin_psi_m,
-                              -c_dev + 0.5 * self.sin_psi_m,
-                              s_dev])
-        else:
-            # Апекс: девиаторное направление не определено -> пластичность
-            # только по объёмной составляющей, девиаторная часть остаётся упругой
-            n_vec = np.array([0.5 * self.sin_phi_m, 0.5 * self.sin_phi_m, 0.0])
-            m_vec = np.array([0.5 * self.sin_psi_m, 0.5 * self.sin_psi_m, 0.0])
-
-        Dm = self.D_rock @ m_vec
-        den_ep = n_vec @ Dm
-        if abs(den_ep) > 1e-12:
-            D_ep = self.D_rock - np.outer(Dm, self.D_rock @ n_vec) / den_ep
-        else:
-            D_ep = self.D_rock.copy()
-
-        return sig_mat, deps_p_mat, D_ep
+        return rm_matrix_kernel(sig_tr, self.D_rock, self.D_rock_inv,
+                                self.sin_phi_m, self.cos_phi_m,
+                                self.sin_psi_m, self.c_m)
 
     # ------------------------------------------------------------------
     # Return mapping шва (локальные ЭФФЕКТИВНЫЕ напряжения)
@@ -341,170 +286,56 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         """
         Возвращает: sig_eff_new (локальное эффективное), dlams=[t, c, s],
                     dq, deps_p_local (приращение пластической деформации, локальные оси).
+        Вычисления — в Numba-JIT ядре (_uj2d_numba.rm_stress_kernel),
+        формулы идентичны исходной NumPy-реализации (включая выбор
+        активного набора поверхностей и fallback при сингулярной
+        системе 2x2).
         """
-        sn_tr = sig_tr_local[0]
-        tau_tr = sig_tr_local[2]
-
-        abs_tau_tr = abs(tau_tr)
-        sign_tau = 1.0 if tau_tr >= 0 else -1.0
-
-        ft_curr = self.f_t + self.q_old
-        c_curr = self._c_curr(self.q_old)
-
-        F1_tr = sn_tr - ft_curr                                 # растяжение
-        F3_tr = -sn_tr - self.f_c                               # сжатие
-        F2_tr = abs_tau_tr + sn_tr * self.tan_phi - c_curr      # сдвиг
-
-        dlams = np.zeros(3)
-        tol = 1e-8
-
-        if F1_tr <= tol and F2_tr <= tol and F3_tr <= tol:
-            return sig_tr_local.copy(), dlams, 0.0, np.zeros(3)
-
-        denom_t = self.E_n + self.H_t
-        denom_s = self.G_s + self.E_n * self.tan_phi * self.tan_psi
-
-        # --- Выбор активного набора поверхностей ---
-        if F1_tr > tol and (abs_tau_tr + ft_curr * self.tan_phi - c_curr) <= tol:
-            # Чистое растяжение
-            dlams[0] = F1_tr / denom_t
-
-        elif F3_tr > tol and (abs_tau_tr - self.f_c * self.tan_phi - c_curr) <= tol:
-            # Чистое сжатие
-            dlams[1] = F3_tr / self.E_n
-
-        elif (F1_tr > tol and (abs_tau_tr + ft_curr * self.tan_phi - c_curr > tol)) or \
-                (F2_tr > tol and (F1_tr - (F2_tr / denom_s) * self.E_n * self.tan_psi > tol)):
-            # Угол растяжение + сдвиг
-            A = np.array([
-                [denom_t,                self.E_n * self.tan_psi],
-                [self.E_n * self.tan_phi, denom_s]
-            ])
-            B = np.array([F1_tr, F2_tr])
-            try:
-                x = np.linalg.solve(A, B)
-            except np.linalg.LinAlgError:
-                x = np.zeros(2)
-
-            if x[0] < 0.0:
-                # Активна только сдвиговая поверхность
-                dlams[2] = max(F2_tr, 0.0) / denom_s
-            elif x[1] < 0.0:
-                # Активна только поверхность растяжения
-                dlams[0] = max(F1_tr, 0.0) / denom_t
-            else:
-                dlams[0], dlams[2] = x[0], x[1]
-
-        elif (F2_tr > tol and (F3_tr + (F2_tr / denom_s) * self.E_n * self.tan_psi > tol)) or \
-                (F3_tr > tol and (abs_tau_tr - self.f_c * self.tan_phi - c_curr > tol)):
-            # Угол сжатие + сдвиг
-            A = np.array([
-                [self.E_n, -self.E_n * self.tan_psi],
-                [-self.E_n * self.tan_phi,  denom_s]
-            ])
-            B = np.array([F3_tr, F2_tr])
-            try:
-                x = np.linalg.solve(A, B)
-            except np.linalg.LinAlgError:
-                x = np.zeros(2)
-
-            if x[0] < 0.0:
-                dlams[2] = max(F2_tr, 0.0) / denom_s
-            elif x[1] < 0.0:
-                dlams[1] = max(F3_tr, 0.0) / self.E_n
-            else:
-                dlams[1], dlams[2] = x[0], x[1]
-
-        elif F2_tr > tol:
-            # Чистый сдвиг
-            dlams[2] = F2_tr / denom_s
-
-        # --- Единое вычисление пластической деформации и возврата напряжений ---
-        m_t = np.array([1.0, 0.0, 0.0])
-        m_c = np.array([-1.0, 0.0, 0.0])
-        m_s = np.array([self.tan_psi, 0.0, sign_tau])
-        deps_p_local = dlams[0] * m_t + dlams[1] * m_c + dlams[2] * m_s
-
-        sig_eff_new = sig_tr_local - self.D_local @ deps_p_local
-        dq = dlams[0] * self.H_t
-
-        return sig_eff_new, dlams, dq, deps_p_local
+        return rm_stress_kernel(sig_tr_local, self.D_local,
+                                self.E_n, self.G_s, self.H_t,
+                                self.f_t, self.f_c, self.c,
+                                self.q_old, self.q_lim,
+                                self.tan_phi, self.tan_psi)
 
     # ------------------------------------------------------------------
     # Поврежденность
     # ------------------------------------------------------------------
     def _calculate_damage(self, W_pl_t, W_pl_c, W_pl_s, q_new, sn_eff):
-        r_t = min(W_pl_t / self.Gf_t, 1.0)
-        r_c = min(W_pl_c / self.Gf_c, 1.0)
-        r_s = min(W_pl_s / self.Gf_s, 1.0)
-
-        Fp_t = r_t * (2.0 - r_t)
-        Fp_c = 0.5 * (np.sin(np.pi * r_c - 0.5 * np.pi) + 1.0)
-        Fp_s = r_s * (2.0 - r_s)
-
-        dt = Fp_t + self.a_t * Fp_s * (1.0 - Fp_t)
-        D_nt = 1.0 - (1.0 - dt) * self.f_t / (self.f_t + q_new + 1e-12)
-
-        D_nc = (1.0 - self.fcr_over_fc) * Fp_c
-
-        ds_base = min(max(self.a_s * Fp_t * (1 - Fp_s) * (1 - Fp_c)
-                          + Fp_s + Fp_c - Fp_s * Fp_c, 0.0), 1.0)
-        if sn_eff < 0.0:
-            abs_sn = -sn_eff
-            D_s = ds_base * (self.c + abs_sn * (self.tan_phi - self.tan_phi_r)) / (
-                    self.c + abs_sn * self.tan_phi + 1e-12)
-        else:
-            D_s = ds_base
-
-        return (min(D_nt, self.d_nt_max),
-                min(D_nc, self.d_nc_max),
-                min(D_s, self.d_s_max))
+        """Вычисления — в Numba-JIT ядре (_uj2d_numba.damage_kernel)."""
+        return damage_kernel(W_pl_t, W_pl_c, W_pl_s, q_new, sn_eff,
+                             self.Gf_t, self.Gf_c, self.Gf_s,
+                             self.a_t, self.a_s, self.f_t, self.c,
+                             self.tan_phi, self.tan_phi_r,
+                             self.fcr_over_fc,
+                             self.d_nt_max, self.d_nc_max, self.d_s_max)
 
     def _apply_damage(self, sig_eff_local, D_n, D_s):
-        """Единственное место, где эффективные напряжения переводятся в номинальные."""
-        sig_nom = sig_eff_local.copy()
-        sig_nom[0] *= (1.0 - D_n)
-        sig_nom[2] *= (1.0 - D_s)
+        """Единственное место, где эффективные напряжения переводятся в номинальные.
 
-        # Регуляризация: деградация матрицы вдоль трещины, ограниченная капом.
-        # matrix_parallel_damage_cap = 0 полностью отключает механизм.
-        if self.matrix_parallel_damage_cap > 0.0:
-            D_parallel = min(max(D_n, D_s), self.matrix_parallel_damage_cap)
-            sig_nom[1] *= (1.0 - D_parallel)
-
-        return sig_nom
+        Вычисления — в Numba-JIT ядре (_uj2d_numba.apply_damage_kernel).
+        """
+        return apply_damage_kernel(sig_eff_local, D_n, D_s,
+                                   self.matrix_parallel_damage_cap)
 
     # ------------------------------------------------------------------
     # Основной расчет напряженного состояния (эффективное пространство)
     # ------------------------------------------------------------------
     def _evaluate_joint(self, sig_tr_local):
-        """Return mapping шва + обновление энергий/поврежденности (trial-значения)."""
-        sig_eff_new, dlams, dq, deps_p_local = self._return_mapping_stress(sig_tr_local)
+        """Return mapping шва + обновление энергий/поврежденности (trial-значения).
 
-        sig_n_yield_start = self.f_t + self.q_old
-        dW_t = max(0.5 * (sig_n_yield_start + sig_eff_new[0]) * dlams[0], 0.0)
-        dW_c = max(abs(sig_eff_new[0]) * dlams[1], 0.0)
-        dW_s = max((abs(sig_eff_new[2]) + sig_eff_new[0] * self.tan_psi) * dlams[2], 0.0)
-
-        W_pl_t = self.W_pl_t_old + dW_t
-        W_pl_c = self.W_pl_c_old + dW_c
-        W_pl_s = self.W_pl_s_old + dW_s
-        q_new = self.q_old + dq
-
-        D_nt_calc, D_nc_calc, D_s_calc = self._calculate_damage(
-            W_pl_t, W_pl_c, W_pl_s, q_new, sig_eff_new[0])
-
-        # Необратимость поврежденности
-        D_nt = max(D_nt_calc, self.D_nt_old)
-        D_nc = max(D_nc_calc, self.D_nc_old)
-        D_s = max(D_s_calc, self.D_s_old)
-
-        D_n = D_nt if sig_eff_new[0] >= 0 else D_nc
-
-        sig_nom_local = self._apply_damage(sig_eff_new, D_n, D_s)
-
-        return (sig_nom_local, sig_eff_new, deps_p_local,
-                W_pl_t, W_pl_c, W_pl_s, q_new, D_nt, D_nc, D_s, D_n)
+        Вычисления — в Numba-JIT ядре (_uj2d_numba.evaluate_joint_kernel),
+        формулы идентичны исходной NumPy-реализации.
+        """
+        return evaluate_joint_kernel(
+            sig_tr_local, self.D_local,
+            self.E_n, self.G_s, self.H_t, self.f_t, self.f_c, self.c,
+            self.q_old, self.q_lim, self.tan_phi, self.tan_psi,
+            self.tan_phi_r,
+            self.W_pl_t_old, self.W_pl_c_old, self.W_pl_s_old,
+            self.D_nt_old, self.D_nc_old, self.D_s_old,
+            self.Gf_t, self.Gf_c, self.Gf_s, self.a_t, self.a_s,
+            self.fcr_over_fc, self.d_nt_max, self.d_nc_max, self.d_s_max,
+            self.matrix_parallel_damage_cap)
 
     # ------------------------------------------------------------------
     # Секущая матрица (согласована с _apply_damage)
@@ -513,9 +344,6 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         if not self.is_locked_trial:
             # Трещины нет: тангенс матрицы (упругий или эласто-пластический DP)
             return self.D_matrix_ep.copy()
-
-        # База — тангенс матрицы в локальных осях трещины (учитывает пластику DP)
-        D_sec_local = self.T_sig @ self.D_matrix_ep @ self.T_eps_inv
 
         # Те же (1-D), что и в номинальных напряжениях;
         # min_stiff_factor — пол исключительно для устойчивости решателя.
@@ -530,14 +358,12 @@ class UbiquitousJointModel2D(ConstitutiveModel):
         else:
             f_p = 1.0
 
-        D_sec_local[0, :] *= f_n
-        D_sec_local[:, 0] *= f_n
-        D_sec_local[1, :] *= f_p
-        D_sec_local[:, 1] *= f_p
-        D_sec_local[2, :] *= f_s
-        D_sec_local[:, 2] *= f_s
-
-        return self.T_eps.T @ D_sec_local @ self.T_eps
+        # База — тангенс матрицы в локальных осях трещины (учитывает пластику
+        # DP); масштабирование на (1-D) и поворот в глобальные оси —
+        # в Numba-JIT ядре (_uj2d_numba.secant_locked_kernel).
+        return secant_locked_kernel(self.T_sig, self.D_matrix_ep,
+                                    self.T_eps_inv, self.T_eps,
+                                    f_n, f_s, f_p)
 
     # ------------------------------------------------------------------
     # Численный (конечно-разностный) алгоритмический тангенс

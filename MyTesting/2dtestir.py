@@ -1,4 +1,3 @@
-import sys
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -56,9 +55,8 @@ def generate_rect_mesh(Lx, Ly, nx, ny, material, factory):
     return model
 
 
-def run_masonry_wall_test(sample_name="J4D", nq=10, show_plot=True, tangent_mode='secant'):
+def run_masonry_wall_test(sample_name="J4D"):
     print(f"=== ТЕСТ: Сдвиговая стена 2D в осях X-Y (Валидация по образцу {sample_name}) ===")
-    print(f"Сетка: {nq} x {nq} элементов")
 
     # Словарь экспериментальных данных (Fz0 переименовано в Fy0)
     exp_data = {
@@ -91,17 +89,18 @@ def run_masonry_wall_test(sample_name="J4D", nq=10, show_plot=True, tangent_mode
     # Параметры материала
     MASONRY_E = 3500e6
     MASONRY_NU = 0.2
-    MASONRY_MU = 0.577
+    MASONRY_MU = 0.56
     MASONRY_RP = 001.00e6
     MASONRY_RC = 12.0e6
 
     cp_material = cp_mt.Material(
         mu=MASONRY_MU,
         A_tensor=A_matrix,
-        Rpx=MASONRY_RP*0.70, Rpy=MASONRY_RP * 0.5, Rpz=MASONRY_RP * 0.70,
+        Rpx=MASONRY_RP*0.45, Rpy=MASONRY_RP * 0.35, Rpz=MASONRY_RP * 0.45,
         Rcx=MASONRY_RC*0.75, Rcy=MASONRY_RC * 1.0, Rcz=MASONRY_RC * 1.0
     )
 
+    nq = 15
     SIZE_X, SIZE_Y = 1.0, 1.0
     THICKNESS = 0.10
     nx, ny = nq, nq
@@ -110,19 +109,19 @@ def run_masonry_wall_test(sample_name="J4D", nq=10, show_plot=True, tangent_mode
 
     # Параметры ослабленной плоскости (трещины)
     joint_params = {
-        # 'tangent_mode': 'numerical',
-        'tangent_mode': tangent_mode,
+        'tangent_mode': 'numerical',
+        # 'tangent_mode': 'secant',
         'phi': 030.0,
-        'psi': 0.0,
-        'phi_r': 24.0,
+        'psi': 05.0,
+        'phi_r': 20.0,
         'cp_material': cp_material,
         'l_c': char_len,
-        'Gf_t': 80,
-        'Gf_c': 3000,
-        'Gf_s': 800,
-        'a_t': 0.100,
-        'a_s': 0.00,
-        'mu': 0.20,  # доля остаточной деформации трещины (damage-plasticity split), НЕ трение
+        'Gf_t': 200,
+        'Gf_c': 12000,
+        'Gf_s': 2000,
+        'a_t': 0.500,
+        'a_s': 0.500,
+        'mu': 0.60,  # доля остаточной деформации трещины (damage-plasticity split), НЕ трение
         'fcr_over_fc': 0.10
     }
 
@@ -131,7 +130,7 @@ def run_masonry_wall_test(sample_name="J4D", nq=10, show_plot=True, tangent_mode
     matrix_params = {
         'c': 001.400e6,  # Сцепление матрицы (Па)
         'phi': 30.0,  # Угол внутреннего трения матрицы (градусы)
-        'psi': 0.0  # Угол дилатансии матрицы (градусы)
+        'psi': 05.0  # Угол дилатансии матрицы (градусы)
     }
 
     global_material = JointedMaterial(
@@ -221,7 +220,7 @@ def run_masonry_wall_test(sample_name="J4D", nq=10, show_plot=True, tangent_mode
     print(f"Сетка обновлена: {len(model.nodes)} узлов, {len(model.elements)} элементов.")
 
     # 50 шагов нагружения до 1.0 (100% от TARGET_DISP_X)
-    load_factors = np.linspace(0, 1.0, 50)[1:]
+    load_factors = np.linspace(0, 1.0, 200)[1:]
 
     control = StagedNRControl2D(
         model=model,
@@ -229,10 +228,8 @@ def run_masonry_wall_test(sample_name="J4D", nq=10, show_plot=True, tangent_mode
         load_factors=load_factors,
         track_dof=0,  # Отслеживаем реакцию по оси X
         max_iter=50,
-        tol=1e-2
+        tol=1e-3
     )
-    print(f"[TEST CONFIG] nq={nq}, l_c={char_len:.5f}, springs={len(control_nodes)}")
-    sys.stdout.flush()
 
     control.solve()
 
@@ -269,13 +266,7 @@ def run_masonry_wall_test(sample_name="J4D", nq=10, show_plot=True, tangent_mode
     plt.grid(True, linestyle=':', alpha=0.7)
     plt.legend(loc='lower right')
     plt.tight_layout()
-    if show_plot:
-        plt.show()
-    else:
-        plt.savefig(f"wall_curve_{sample_name}_nq{nq}.png", dpi=150)
-    plt.close()
-
-    return control, fx_kN, ux_mm
+    plt.show()
 
 
 if __name__ == "__main__":

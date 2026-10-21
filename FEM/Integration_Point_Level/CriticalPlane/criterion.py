@@ -1,11 +1,12 @@
 import numpy as np
-import pytest
+from functools import lru_cache
+
 from FEM.Integration_Point_Level.CriticalPlane.tensor import StressTensor
 import FEM.Integration_Point_Level.CriticalPlane.material as mt
 
 
 # ==========================================
-# ДОБАВЛЕНО: Функция вычисления вектора нормали
+# Функция вычисления вектора нормали
 # ==========================================
 def get_normal_vector(params, mode='2D_XY'):
     """
@@ -31,7 +32,7 @@ def get_normal_vector(params, mode='2D_XY'):
 
 
 # ==========================================
-# НОВЫЙ БЛОК: ГЕНЕРАЦИЯ ДИСКРЕТНЫХ ПЛОЩАДОК (ОПТИМИЗАЦИЯ)
+# ГЕНЕРАЦИЯ ДИСКРЕТНЫХ ПЛОЩАДОК
 # ==========================================
 def generate_discrete_params(num_planes, mode='2D_XY'):
     """
@@ -65,8 +66,72 @@ def generate_discrete_params(num_planes, mode='2D_XY'):
     return params_list
 
 
+@lru_cache(maxsize=64)
+def _normals_matrix(num_planes, mode):
+    """
+    Кэшированная матрица нормалей формы (num_planes, 3).
+    Полностью соответствует generate_discrete_params, но строится один раз
+    и используется для векторизованного поиска по всем площадкам сразу.
+    """
+    if mode == '3D':
+        if num_planes == 1:
+            return np.array([[0.0, 0.0, 1.0]])
+        i = np.arange(num_planes, dtype=float)
+        y = np.clip(1.0 - (i / (num_planes - 1)) * 2.0, -1.0, 1.0)
+        theta = np.arccos(y)
+        phi = (i * (np.pi * (3.0 - np.sqrt(5.0)))) % (2.0 * np.pi)
+        sin_t = np.sin(theta)
+        return np.column_stack((sin_t * np.cos(phi), sin_t * np.sin(phi), np.cos(theta)))
+    elif mode == '2D_XY':
+        theta = np.arange(num_planes, dtype=float) * (np.pi / num_planes)
+        return np.column_stack((np.cos(theta), np.sin(theta), np.zeros(num_planes)))
+    else:
+        raise ValueError(f"Неизвестный режим: {mode}")
+
+
 # ==========================================
-# БЛОК: ОТДЕЛЬНЫЕ ФУНКЦИИ ПРЕДЕЛОВ ПРОЧНОСТИ
+# ВЕКТОРИЗОВАННЫЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ==========================================
+def _traction_batch(matrix, N):
+    """Векторы напряжений t = sigma · n для всех нормалей сразу. N: (m, 3)."""
+    # Матрица тензора симметрична, поэтому N @ matrix == (matrix @ N.T).T
+    return N @ matrix
+
+
+def _cohesion_batch(N, T, sigma_n, A_tensor):
+    """
+    Векторизованный аналог get_cohesion_limit: предельное сцепление C
+    для всех площадок одновременно.
+
+    N : (m, 3) — нормали; T : (m, 3) — traction (sigma·n);
+    sigma_n : (m,) — нормальные напряжения.
+    Возвращает (C : (m,), tau_n : (m,)).
+    """
+    tau_vec = T - sigma_n[:, None] * N
+    tau_n = np.sqrt(np.maximum(np.einsum('ni,ni->n', tau_vec, tau_vec), 0.0))
+
+    # Направление сдвига s_geom
+    S = np.empty_like(N)
+    big = tau_n > 1e-9
+    S[big] = tau_vec[big] / tau_n[big, None]
+    if (~big).any():
+        # Произвольное направление, ортогональное нормали (как в скалярной версии)
+        Ns = N[~big]
+        ref = np.where(np.abs(Ns[:, 2:3]) < 0.9,
+                       np.array([0.0, 0.0, 1.0]),
+                       np.array([1.0, 0.0, 0.0]))
+        s = np.cross(Ns, ref)
+        s /= np.linalg.norm(s, axis=1, keepdims=True)
+        S[~big] = s
+
+    # v = n (x) s, развернутый в вектор длины 9; C = sqrt(v @ A @ v)
+    V = (N[:, :, None] * S[:, None, :]).reshape(len(N), 9)
+    C_sq = np.einsum('ni,ij,nj->n', V, A_tensor, V)
+    return np.sqrt(np.maximum(C_sq, 0.0)), tau_n
+
+
+# ==========================================
+# ОТДЕЛЬНЫЕ ФУНКЦИИ ПРЕДЕЛОВ ПРОЧНОСТИ
 # ==========================================
 def get_tensile_limit(n, material: mt.Material):
     """Вычисляет предел прочности на растяжение на заданной площадке"""
@@ -80,11 +145,15 @@ def get_compression_limit(n, material: mt.Material):
 
 def get_cohesion_limit(n, stress_tensor: StressTensor, material: mt.Material):
     """Вычисляет предельное сцепление (C) на площадке с учетом направления сдвига"""
-    tau_n = stress_tensor.shear_stress_magnitude(n)
+    # Считаем traction один раз и выводим из него все остальное
+    t = stress_tensor.traction(n)
+    sigma_n = np.dot(n, t)
+    tau_vec = t - sigma_n * n
+    tau_n = np.linalg.norm(tau_vec)
 
     # Направление сдвига (s_geom) – единичный вектор в плоскости площадки
     if tau_n > 1e-9:
-        s_geom = stress_tensor.shear_stress_vector(n) / tau_n
+        s_geom = tau_vec / tau_n
     else:
         # Выбираем произвольное направление, ортогональное нормали
         # Для плоскости XY n[2] всегда 0, так что это условие отработает идеально
@@ -102,18 +171,28 @@ def get_cohesion_limit(n, stress_tensor: StressTensor, material: mt.Material):
 # ==========================================
 def calculate_criterion_shear(params, stress_tensor, material: mt.Material, mode='2D_XY'):
     n = get_normal_vector(params, mode)
-    sigma_n = stress_tensor.normal_stress(n)
-    tau_n = stress_tensor.shear_stress_magnitude(n)
 
-    # Используем новую отдельную функцию вычисления сцепления
-    C_val = get_cohesion_limit(n, stress_tensor, material)
-    # print(C_val)
+    # Один traction — далее все величины выводятся из него без повторных умножений
+    t = stress_tensor.traction(n)
+    sigma_n = np.dot(n, t)
+    tau_vec = t - sigma_n * n
+    tau_n = np.linalg.norm(tau_vec)
+
+    # Сцепление на площадке с учетом направления сдвига
+    if tau_n > 1e-9:
+        s_geom = tau_vec / tau_n
+    else:
+        if abs(n[2]) < 0.9:
+            s_geom = np.cross(n, np.array([0, 0, 1]))
+        else:
+            s_geom = np.cross(n, np.array([1, 0, 0]))
+        s_geom = s_geom / np.linalg.norm(s_geom)
+    C_val = material.get_cohesion(n, s_geom)
 
     # Сопротивление сдвигу (закон Кулона-Мора)
     # Сжатие - отрицательно (sigma_n < 0), поэтому мы ВЫЧИТАЕМ sigma_n, чтобы сопротивление РОСЛО
     if sigma_n > 0:
         # При растяжении сопротивление падает. Ограничиваем нулем, чтобы не получить отрицательный предел
-        # material.mu — единый коэффициент трения для критерия Кулона-Мора
         resistance = max(0.0, C_val - material.mu * sigma_n)
     else:
         # При сжатии (sigma_n <= 0) сопротивление растет
@@ -124,24 +203,28 @@ def calculate_criterion_shear(params, stress_tensor, material: mt.Material, mode
 
 
 def find_critical_plane_shear(stress_tensor, material, mode='2D_XY', num_planes=10):
-    best_params = None
-    max_f = -float('inf')
+    # Векторизованный расчет критерия сразу для всех площадок
+    N = _normals_matrix(num_planes, mode)
+    T = _traction_batch(stress_tensor.matrix, N)
+    sigma_n = np.einsum('ni,ni->n', N, T)
+    C_val, tau_n = _cohesion_batch(N, T, sigma_n, material.A_tensor)
 
-    # Дискретный поиск по заданному количеству площадок
-    params_list = generate_discrete_params(num_planes, mode)
-    for p in params_list:
-        f_val, _, _, _ = calculate_criterion_shear(p, stress_tensor, material, mode)
-        if f_val > max_f:
-            max_f = f_val
-            best_params = p
+    mu = material.mu
+    resistance = np.where(sigma_n > 0.0,
+                          np.maximum(0.0, C_val - mu * sigma_n),
+                          C_val - mu * sigma_n)
+    f = tau_n - resistance
 
-    # Полный расчет для наихудшей (критической) площадки
-    _, best_n, tau_n, resistance = calculate_criterion_shear(best_params, stress_tensor, material, mode)
+    idx = int(np.argmax(f))
+    max_f = float(f[idx])
+    best_n = N[idx].copy()
+    tau_best = float(tau_n[idx])
+    res_best = float(resistance[idx])
 
-    if abs(resistance) < 1e-9:
-        utilization = float('inf') if tau_n > 1e-9 else 0.0
+    if abs(res_best) < 1e-9:
+        utilization = float('inf') if tau_best > 1e-9 else 0.0
     else:
-        utilization = tau_n / resistance
+        utilization = tau_best / res_best
 
     return max_f, best_n, utilization
 
@@ -161,23 +244,24 @@ def calculate_criterion_tensile(params, stress_tensor, material, mode='2D_XY'):
 
 
 def find_critical_plane_tensile(stress_tensor, material, mode='2D_XY', num_planes=10):
-    best_params = None
-    max_f = -float('inf')
+    # Векторизованный расчет критерия сразу для всех площадок
+    N = _normals_matrix(num_planes, mode)
+    T = _traction_batch(stress_tensor.matrix, N)
+    sigma_n = np.einsum('ni,ni->n', N, T)
+    Rp = (N * N) @ np.array([material.Rpx, material.Rpy, material.Rpz])
 
-    # Дискретный поиск
-    params_list = generate_discrete_params(num_planes, mode)
-    for p in params_list:
-        f_val, _, _, _ = calculate_criterion_tensile(p, stress_tensor, material, mode)
-        if f_val > max_f:
-            max_f = f_val
-            best_params = p
+    f = sigma_n - Rp
 
-    _, best_n, sigma_n, Rp_n = calculate_criterion_tensile(best_params, stress_tensor, material, mode)
+    idx = int(np.argmax(f))
+    max_f = float(f[idx])
+    best_n = N[idx].copy()
+    s = float(sigma_n[idx])
+    r = float(Rp[idx])
 
-    if Rp_n < 1e-9:
+    if r < 1e-9:
         utilization = float('inf')
     else:
-        utilization = sigma_n / Rp_n if sigma_n > 0 else 0.0
+        utilization = s / r if s > 0 else 0.0
 
     return max_f, best_n, utilization
 
@@ -197,23 +281,23 @@ def calculate_criterion_compression(params, stress_tensor, material, mode='2D_XY
 
 
 def find_critical_plane_compression(stress_tensor, material, mode='2D_XY', num_planes=10):
-    best_params = None
-    max_f = -float('inf')
+    # Векторизованный расчет критерия сразу для всех площадок
+    N = _normals_matrix(num_planes, mode)
+    T = _traction_batch(stress_tensor.matrix, N)
+    sigma_n = np.einsum('ni,ni->n', N, T)
+    Rc = (N * N) @ np.array([material.Rcx, material.Rcy, material.Rcz])
 
-    # Дискретный поиск
-    params_list = generate_discrete_params(num_planes, mode)
-    for p in params_list:
-        f_val, _, _, _ = calculate_criterion_compression(p, stress_tensor, material, mode)
-        if f_val > max_f:
-            max_f = f_val
-            best_params = p
+    f = -sigma_n - Rc
 
-    _, best_n, sigma_n, Rc_n = calculate_criterion_compression(best_params, stress_tensor, material, mode)
+    idx = int(np.argmax(f))
+    max_f = float(f[idx])
+    best_n = N[idx].copy()
+    comp_stress = -float(sigma_n[idx])
+    r = float(Rc[idx])
 
-    comp_stress = -sigma_n
-    if Rc_n < 1e-9:
+    if r < 1e-9:
         utilization = float('inf')
     else:
-        utilization = comp_stress / Rc_n if comp_stress > 0 else 0.0
+        utilization = comp_stress / r if comp_stress > 0 else 0.0
 
     return max_f, best_n, utilization

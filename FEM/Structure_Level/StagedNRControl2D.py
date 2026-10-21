@@ -2,6 +2,7 @@ import warnings
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+from traits.trait_types import true
 
 from FEM.Abstract.Structure_Level import Control
 from FEM.Structure_Level.MaterialLogger import MaterialLogger
@@ -18,7 +19,7 @@ class StagedNRControl2D(Control):
     """
 
     def __init__(self, model, track_nodes, load_factors, track_dof=1,
-                 max_iter=300, tol=1e-3, refactor_every=1, enable_logging=False):
+                 max_iter=300, tol=1e-3, refactor_every=1, enable_logging= True):
         super().__init__(model)
         self.load_factors = load_factors
         self.num_steps = len(load_factors)
@@ -378,7 +379,7 @@ class StagedNRControl2D(Control):
                 ls_success = True
                 if iteration > 0 and norm_res > norm_res_prev * 0.9:
                     ls_success = False
-                    for _ in range(20):
+                    for _ in range(10):
                         U_trial = U_global + eta * dU
                         Residual_trial = F_ext - self._internal_forces(U_trial, need_K=False)
                         self._apply_bc_residual(Residual_trial, U_trial, attempt_factor)

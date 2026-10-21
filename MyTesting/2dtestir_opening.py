@@ -92,9 +92,9 @@ def generate_rect_mesh_with_opening(Lx, Ly, nx, ny, material, factory,
     return model
 
 
-def run_masonry_wall_opening_test(sample_name="J4D", nx=15, ny=15, k_stiffness=1e10,
-                                  k_beam=1e13, scale_kx_by_nodes=False, target_disp=0.025,
-                                  n_shear=50, n_preload=21):
+def run_masonry_wall_opening_test(sample_name="J4G", nx=15, ny=15, k_stiffness=1e10,
+                                  k_beam=1e13, scale_kx_by_nodes=False, target_disp=0.02,
+                                  n_shear=100, n_preload=21):
     print(f"=== ТЕСТ: Сдвиговая стена 2D с проемом в осях X-Y (Валидация по образцу {sample_name}) ===")
     print(f"Сетка: {nx}x{ny}, kx={k_stiffness:.2e}, k_beam={k_beam:.2e}, scale_kx_by_nodes={scale_kx_by_nodes}")
 
@@ -135,7 +135,7 @@ def run_masonry_wall_opening_test(sample_name="J4D", nx=15, ny=15, k_stiffness=1
     cp_material = cp_mt.Material(
         mu=MASONRY_MU,
         A_tensor=A_matrix,
-        Rpx=MASONRY_RP*01.0, Rpy=MASONRY_RP * 0.5, Rpz=MASONRY_RP * 01.0,
+        Rpx=MASONRY_RP*0.45, Rpy=MASONRY_RP * 0.35, Rpz=MASONRY_RP * 0.45,
         Rcx=MASONRY_RC*0.75, Rcy=MASONRY_RC * 1.0, Rcz=MASONRY_RC * 1.0
     )
 
@@ -162,19 +162,19 @@ def run_masonry_wall_opening_test(sample_name="J4D", nx=15, ny=15, k_stiffness=1
 
     # Параметры ослабленной плоскости (трещины)
     joint_params = {
-        # 'tangent_mode': 'numerical',
-        'tangent_mode': 'secant',
+        'tangent_mode': 'numerical',
+        # 'tangent_mode': 'secant',
         'phi': 030.0,
-        'psi': 0.0,
-        'phi_r': 0.0,
+        'psi': 05.0,
+        'phi_r': 20.0,
         'cp_material': cp_material,
         'l_c': char_len,
-        'Gf_t': 400,
-        'Gf_c': 3000,
-        'Gf_s': 800,
-        'a_t': 0.100,
-        'a_s': 0.00,
-        'mu': 0.20,  # доля остаточной деформации трещины (damage-plasticity split), НЕ трение
+        'Gf_t': 200,
+        'Gf_c': 12000,
+        'Gf_s': 2000,
+        'a_t': 0.500,
+        'a_s': 0.500,
+        'mu': 0.60,  # доля остаточной деформации трещины (damage-plasticity split), НЕ трение
         'fcr_over_fc': 0.10
     }
 
@@ -317,12 +317,16 @@ def run_masonry_wall_opening_test(sample_name="J4D", nx=15, ny=15, k_stiffness=1
         load_factors=shear_factors,
         track_dof=0,  # Отслеживаем реакцию по оси X
         max_iter=50,
-        tol=5e-2,
-        enable_logging=False
+        tol=1e-2,
+        enable_logging=True
     )
     control.solve(initial_displacements=np.concatenate(
         [node.displacements for node in model.nodes]
     ))
+
+    # Отчёт о развитии трещин и критериях разрушения (консоль + Excel)
+    control.mat_logger.print_summary()
+    control.mat_logger.save_to_excel(f"material_log_opening_{sample_name}.xlsx")
 
     # Извлечение данных для графика второй стадии — горизонтального сдвига.
     ux_mm = [u * 1000 for u in control.history_U]
